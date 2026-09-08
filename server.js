@@ -21,6 +21,23 @@ app.use(cors());
 app.use(express.json());
 
 
+// ================= 1. CHAVE MESTRA DA API (HEADER KEY) =================
+// Esta chave deve ser enviada pelo Android no cabeçalho "x-api-key" de TODAS as requisições
+const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
+
+function verifyApiKey(req, res, next) {
+    const clientApiKey = req.headers['x-api-key'];
+
+    if (!clientApiKey || clientApiKey !== API_KEY_SECRET) {
+        return res.status(403).json({ error: 'Acesso negado: Chave de API inválida ou ausente.' });
+    }
+    next();
+}
+
+// Aplica a trava da API Key em TODAS as rotas do servidor
+app.use(verifyApiKey);
+
+
 // ================= STORAGE =================
 
 const STORAGE = process.env.STORAGE || "r2";
@@ -37,7 +54,7 @@ mongoose.connect(process.env.MONGO_URL)
 });
 
 
-// ================= USER =================
+// ================= USER SCHEMA =================
 
 const UserSchema = new mongoose.Schema({
     email: {
@@ -54,6 +71,11 @@ const UserSchema = new mongoose.Schema({
     plan: {
         type: String,
         default: 'FREE' // Aceita 'FREE' ou 'VIP'
+    },
+
+    purchaseToken: {
+        type: String,
+        default: null // Armazena o recibo/token ativo da Google Play
     },
 
     recoveryCode: {
@@ -94,13 +116,13 @@ async function createUniqueRecoveryCode() {
 }
 
 
-// ================= AUTH =================
+// ================= 2. AUTHENTICATION MIDDLEWARE (JWT USUÁRIO) =================
 
 function auth(req, res, next) {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-        return res.status(401).json({ error: 'Token ausente' });
+        return res.status(401).json({ error: 'Token de sessão ausente' });
     }
 
     try {
@@ -108,12 +130,12 @@ function auth(req, res, next) {
         req.userId = decoded.id;
         next();
     } catch {
-        return res.status(401).json({ error: 'Token inválido' });
+        return res.status(401).json({ error: 'Token de sessão inválido ou expirado' });
     }
 }
 
 
-// ================= R2 =================
+// ================= R2 / CLOUDINARY / MULTER =================
 
 const r2 = new S3Client({
     region: 'auto',
@@ -124,17 +146,11 @@ const r2 = new S3Client({
     }
 });
 
-
-// ================= CLOUDINARY =================
-
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
-
-
-// ================= MULTER =================
 
 const upload = multer({
     storage: multer.memoryStorage()
@@ -149,7 +165,6 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
             return res.status(400).json({ error: 'Arquivo não enviado' });
         }
 
-        // CLOUDFLARE R2
         if (STORAGE === "r2") {
             const ext = req.file.originalname.split('.').pop();
             const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
@@ -170,7 +185,6 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
             });
         }
 
-        // CLOUDINARY
         if (STORAGE === "cloudinary") {
             const result = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream(
@@ -362,6 +376,39 @@ app.put('/profile', auth, async (req, res) => {
 });
 
 
+// ================= VERIFY PURCHASES (GOOGLE PLAY) =================
+
+app.post('/verify-purchase', auth, async (req, res) => {
+    const { purchaseToken, productId } = req.body;
+
+    if (!purchaseToken) {
+        return res.status(400).json({ error: 'Token de compra não enviado' });
+    }
+
+    try {
+        // Rota preparada: atualiza o plano do usuário autenticado no MongoDB para VIP
+        const user = await User.findByIdAndUpdate(
+            req.userId,
+            {
+                plan: 'VIP',
+                purchaseToken: purchaseToken
+            },
+            { new: true }
+        );
+
+        return res.json({
+            success: true,
+            message: 'Plano atualizado para VIP com sucesso!',
+            plan: user.plan
+        });
+
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao processar compra' });
+    }
+});
+
+
 // ================= VERIFY CURRENT PASSWORD =================
 
 app.post('/verify-password', auth, async (req, res) => {
@@ -506,13 +553,13 @@ app.post('/recover-with-code', async (req, res) => {
 });
 
 
-// ================= ADMIN: ALTERAR PLANO DE USUÁRIO (PARA TESTES) =================
+// ================= ADMIN: ALTERAR PLANO DE USUÁRIO (TESTES) =================
 
 app.put('/admin/change-plan', async (req, res) => {
-    const { email, plan } = req.body; // Aceita: "VIP" ou "FREE"
+    const { email, plan } = req.body;
 
     if (!email || !plan) {
-        return res.status(400).json({ error: 'Preencha o e-mail e o plano ("VIP" ou "FREE")' });
+        return res.status(400).json({ error: 'Preencha e-mail e plano ("VIP" ou "FREE")' });
     }
 
     try {
@@ -528,7 +575,7 @@ app.put('/admin/change-plan', async (req, res) => {
 
         return res.json({
             success: true,
-            message: `Plano do usuário ${user.email} atualizado para ${user.plan}`,
+            message: `Plano do usuário ${user.email} alterado para ${user.plan}`,
             user: {
                 id: user._id,
                 email: user.email,
@@ -538,7 +585,7 @@ app.put('/admin/change-plan', async (req, res) => {
 
     } catch (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Erro interno ao alterar plano' });
+        return res.status(500).json({ error: 'Erro ao alterar plano' });
     }
 });
 
@@ -548,5 +595,5 @@ app.put('/admin/change-plan', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log('Servidor rodando na porta', PORT);
+    console.log('Servidor protegido rodando na porta', PORT);
 });

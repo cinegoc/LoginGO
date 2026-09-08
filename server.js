@@ -32,24 +32,49 @@ app.use(express.json());
 // ================= TEMPO REAL (SOCKET.IO) =================
 
 io.on('connection', (socket) => {
+    // Entrar na sala privativa do próprio usuário usando o ID
     socket.on('join_user_room', (userId) => {
         if (userId) {
             socket.join(userId.toString());
+            console.log(`[Socket] Usuário conectado à sala privativa: ${userId}`);
+        }
+    });
+
+    // Permite que o app solicite a busca/sincronização forçada dos dados mais recentes
+    socket.on('request_user_sync', async (userId) => {
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+            try {
+                const user = await User.findById(userId).select('-password');
+                if (user) {
+                    notifyUserUpdate(user._id, user);
+                }
+            } catch (err) {
+                console.error('[Socket] Erro ao sincronizar usuário:', err);
+            }
         }
     });
 });
 
-// Envia atualizações do MongoDB em tempo real para o app Android do usuário
+/**
+ * Emite a atualização INTEGRAL de todos os dados do usuário em tempo real
+ * via Socket.IO para o aplicativo Android.
+ */
 function notifyUserUpdate(userId, user) {
     if (!userId || !user) return;
-    io.to(userId.toString()).emit('user_updated', {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        avatar: user.avatar,
+
+    const userDataPayload = {
+        id: user._id ? user._id.toString() : user.id,
+        name: user.name || "",
+        email: user.email || "",
+        avatar: user.avatar || "",
         plan: user.plan || 'FREE',
-        profile: user.profile
-    });
+        recoveryCode: user.recoveryCode || "",
+        profile: user.profile || {},
+        createdAt: user.createdAt || null
+    };
+
+    console.log(`[Socket] Enviando user_updated para a sala ${userId.toString()}:`, userDataPayload.plan);
+    io.to(userId.toString()).emit('user_updated', userDataPayload);
 }
 
 
@@ -74,18 +99,7 @@ app.use(verifyApiKey);
 const STORAGE = process.env.STORAGE || "r2";
 
 
-// ================= MONGO =================
-
-mongoose.connect(process.env.MONGO_URL)
-.then(() => {
-    console.log('MongoDB conectado');
-})
-.catch(err => {
-    console.error(err);
-});
-
-
-// ================= USER SCHEMA =================
+// ================= MONGO SCHEMA & CONNECT =================
 
 const UserSchema = new mongoose.Schema({
     email: {
@@ -127,8 +141,34 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
+mongoose.connect(process.env.MONGO_URL)
+.then(() => {
+    console.log('MongoDB conectado com sucesso');
 
-// ================= FUNÇÕES =================
+    // ================= CHANGE STREAMS (GATILHO DE TEMPO REAL NO BANCO) =================
+    // Captura qualquer alteração feita direto no MongoDB e dispara para o Android via Socket
+    try {
+        const changeStream = User.watch();
+        changeStream.on('change', async (change) => {
+            if (change.operationType === 'update' || change.operationType === 'replace') {
+                const updatedUserId = change.documentKey._id;
+                const fullUser = await User.findById(updatedUserId).select('-password');
+                if (fullUser) {
+                    console.log(`[ChangeStream] Alteração detectada no banco para o usuário: ${updatedUserId}`);
+                    notifyUserUpdate(updatedUserId, fullUser);
+                }
+            }
+        });
+    } catch (csError) {
+        console.log('[ChangeStream] Notificação por log do MongoDB não suportada sem Replica Set. Usando gatilhos das rotas API.');
+    }
+})
+.catch(err => {
+    console.error('Erro ao conectar no MongoDB:', err);
+});
+
+
+// ================= FUNÇÕES AUXILIARES =================
 
 function generateRecoveryCode() {
     const a = Math.floor(1000 + Math.random() * 9000);
@@ -281,6 +321,7 @@ app.post('/register', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan,
+                recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
         });
@@ -322,6 +363,7 @@ app.post('/login', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
         });
@@ -387,7 +429,7 @@ app.put('/profile', auth, async (req, res) => {
 
         await user.save();
 
-        // Dispara atualização em tempo real para o app
+        // Dispara atualização universal em tempo real para o app Android
         notifyUserUpdate(user._id, user);
 
         return res.json({
@@ -430,7 +472,7 @@ app.post('/verify-purchase', auth, async (req, res) => {
         );
 
         if (user) {
-            // Dispara atualização VIP em tempo real para o app
+            // Dispara atualização em tempo real para o aplicativo Android
             notifyUserUpdate(user._id, user);
         }
 
@@ -540,7 +582,7 @@ app.put('/change-email', auth, async (req, res) => {
         user.email = newEmail.trim();
         await user.save();
 
-        // Dispara atualização em tempo real para o app
+        // Dispara atualização em tempo real para o app Android
         notifyUserUpdate(user._id, user);
 
         return res.json({
@@ -614,7 +656,7 @@ app.put('/admin/change-plan', async (req, res) => {
             return res.status(404).json({ error: 'Usuário não encontrado' });
         }
 
-        // Dispara atualização em tempo real para o app
+        // Dispara atualização universal em tempo real para o app
         notifyUserUpdate(user._id, user);
 
         return res.json({

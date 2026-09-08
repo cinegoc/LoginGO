@@ -29,6 +29,12 @@ app.use(cors());
 app.use(express.json());
 
 
+// ================= ROTA PÚBLICA DE STATUS (HEALTH CHECK PARA O RENDER) =================
+app.get('/', (req, res) => {
+    return res.status(200).json({ status: 'online', message: 'Servidor LoginGO em execução' });
+});
+
+
 // ================= TEMPO REAL (SOCKET.IO) =================
 
 io.on('connection', (socket) => {
@@ -91,6 +97,7 @@ function verifyApiKey(req, res, next) {
     next();
 }
 
+// Aplica a validação de chave de API em todas as rotas registradas abaixo
 app.use(verifyApiKey);
 
 
@@ -146,9 +153,9 @@ mongoose.connect(process.env.MONGO_URL)
     console.log('MongoDB conectado com sucesso');
 
     // ================= CHANGE STREAMS (GATILHO DE TEMPO REAL NO BANCO) =================
-    // Captura qualquer alteração feita direto no MongoDB e dispara para o Android via Socket
     try {
         const changeStream = User.watch();
+        
         changeStream.on('change', async (change) => {
             if (change.operationType === 'update' || change.operationType === 'replace') {
                 const updatedUserId = change.documentKey._id;
@@ -158,6 +165,10 @@ mongoose.connect(process.env.MONGO_URL)
                     notifyUserUpdate(updatedUserId, fullUser);
                 }
             }
+        });
+
+        changeStream.on('error', (csError) => {
+            console.log('[ChangeStream] Notificação por log do MongoDB desativada ou não suportada sem Replica Set.');
         });
     } catch (csError) {
         console.log('[ChangeStream] Notificação por log do MongoDB não suportada sem Replica Set. Usando gatilhos das rotas API.');
@@ -680,6 +691,6 @@ app.put('/admin/change-plan', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-    console.log('Servidor protegido e em tempo real rodando na porta', PORT);
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Servidor protegido e em tempo real rodando na porta ${PORT}`);
 });

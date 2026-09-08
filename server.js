@@ -4,6 +4,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const multer = require('multer');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const {
     S3Client,
@@ -16,13 +18,43 @@ const streamifier = require('streamifier');
 require('dotenv').config();
 
 const app = express();
+const server = http.createServer(app);
+
+// Configuração do Socket.io para comunicação em tempo real
+const io = new Server(server, {
+    cors: { origin: "*" }
+});
 
 app.use(cors());
 app.use(express.json());
 
 
+// ================= TEMPO REAL (SOCKET.IO) =================
+
+io.on('connection', (socket) => {
+    socket.on('join_user_room', (userId) => {
+        if (userId) {
+            socket.join(userId.toString());
+        }
+    });
+});
+
+// Envia atualizações do MongoDB em tempo real para o app Android do usuário
+function notifyUserUpdate(userId, user) {
+    if (!userId || !user) return;
+    io.to(userId.toString()).emit('user_updated', {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        avatar: user.avatar,
+        plan: user.plan || 'FREE',
+        profile: user.profile
+    });
+}
+
+
 // ================= 1. CHAVE MESTRA DA API (HEADER KEY) =================
-// Esta chave deve ser enviada pelo Android no cabeçalho "x-api-key" de TODAS as requisições
+
 const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
 
 function verifyApiKey(req, res, next) {
@@ -34,7 +66,6 @@ function verifyApiKey(req, res, next) {
     next();
 }
 
-// Aplica a trava da API Key em TODAS as rotas do servidor
 app.use(verifyApiKey);
 
 
@@ -70,12 +101,12 @@ const UserSchema = new mongoose.Schema({
 
     plan: {
         type: String,
-        default: 'FREE' // Aceita 'FREE' ou 'VIP'
+        default: 'FREE'
     },
 
     purchaseToken: {
         type: String,
-        default: null // Armazena o recibo/token ativo da Google Play
+        default: null
     },
 
     recoveryCode: {
@@ -356,6 +387,9 @@ app.put('/profile', auth, async (req, res) => {
 
         await user.save();
 
+        // Dispara atualização em tempo real para o app
+        notifyUserUpdate(user._id, user);
+
         return res.json({
             success: true,
             user: {
@@ -386,7 +420,6 @@ app.post('/verify-purchase', auth, async (req, res) => {
     }
 
     try {
-        // Rota preparada: atualiza o plano do usuário autenticado no MongoDB para VIP
         const user = await User.findByIdAndUpdate(
             req.userId,
             {
@@ -395,6 +428,11 @@ app.post('/verify-purchase', auth, async (req, res) => {
             },
             { new: true }
         );
+
+        if (user) {
+            // Dispara atualização VIP em tempo real para o app
+            notifyUserUpdate(user._id, user);
+        }
 
         return res.json({
             success: true,
@@ -502,6 +540,9 @@ app.put('/change-email', auth, async (req, res) => {
         user.email = newEmail.trim();
         await user.save();
 
+        // Dispara atualização em tempo real para o app
+        notifyUserUpdate(user._id, user);
+
         return res.json({
             success: true,
             message: 'E-mail alterado com sucesso',
@@ -573,6 +614,9 @@ app.put('/admin/change-plan', async (req, res) => {
             return res.status(404).json({ error: 'Usuário não encontrado' });
         }
 
+        // Dispara atualização em tempo real para o app
+        notifyUserUpdate(user._id, user);
+
         return res.json({
             success: true,
             message: `Plano do usuário ${user.email} alterado para ${user.plan}`,
@@ -594,6 +638,6 @@ app.put('/admin/change-plan', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-    console.log('Servidor protegido rodando na porta', PORT);
+server.listen(PORT, () => {
+    console.log('Servidor protegido e em tempo real rodando na porta', PORT);
 });

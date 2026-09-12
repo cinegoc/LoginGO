@@ -74,6 +74,7 @@ function notifyUserUpdate(userId, user) {
         email: user.email || "",
         avatar: user.avatar || "",
         plan: user.plan || 'FREE',
+        acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : false,
         recoveryCode: user.recoveryCode || "",
         profile: user.profile || {},
         createdAt: user.createdAt || null
@@ -125,6 +126,12 @@ const UserSchema = new mongoose.Schema({
         default: 'FREE'
     },
 
+    // TRAVA DE SEGURANÇA NO BANCO DE DADOS
+    acesso_liberado: {
+        type: Boolean,
+        default: false
+    },
+
     purchaseToken: {
         type: String,
         default: null
@@ -155,7 +162,7 @@ mongoose.connect(process.env.MONGO_URL)
     // ================= CHANGE STREAMS (GATILHO DE TEMPO REAL NO BANCO) =================
     try {
         const changeStream = User.watch();
-        
+
         changeStream.on('change', async (change) => {
             if (change.operationType === 'update' || change.operationType === 'replace') {
                 const updatedUserId = change.documentKey._id;
@@ -298,7 +305,7 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
 // ================= REGISTER =================
 
 app.post('/register', async (req, res) => {
-    const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
+    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = false, profile = {} } = req.body;
 
     if (!email || !password || !name) {
         return res.status(400).json({ error: 'Preencha todos os campos' });
@@ -319,6 +326,7 @@ app.post('/register', async (req, res) => {
             name,
             avatar,
             plan,
+            acesso_liberado,
             recoveryCode,
             profile
         });
@@ -332,6 +340,7 @@ app.post('/register', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan,
+                acesso_liberado: user.acesso_liberado,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -360,6 +369,15 @@ app.post('/login', async (req, res) => {
             return res.status(401).json({ error: 'Senha inválida' });
         }
 
+        // ================= TRAVA DE SEGURANÇA NO SERVIDOR =================
+        // Se no database o usuário estiver com 'acesso_liberado' como falso ou ausente,
+        // o servidor impede o login e retorna um erro.
+        if (!user.acesso_liberado) {
+            return res.status(403).json({ 
+                error: 'Acesso não liberado pelo Administrador. Entre em contato para ativar sua conta.' 
+            });
+        }
+
         const token = jwt.sign(
             { id: user._id },
             process.env.JWT_SECRET,
@@ -374,6 +392,7 @@ app.post('/login', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                acesso_liberado: user.acesso_liberado,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -402,6 +421,7 @@ app.get('/me', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                acesso_liberado: user.acesso_liberado,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -451,6 +471,7 @@ app.put('/profile', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                acesso_liberado: user.acesso_liberado,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -605,6 +626,7 @@ app.put('/change-email', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                acesso_liberado: user.acesso_liberado,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -683,6 +705,45 @@ app.put('/admin/change-plan', async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro ao alterar plano' });
+    }
+});
+
+
+// ================= ADMIN: LIBERAR OU BLOQUEAR ACESSO DO USUÁRIO =================
+
+app.put('/admin/toggle-access', async (req, res) => {
+    const { email, acesso_liberado } = req.body;
+
+    if (!email || typeof acesso_liberado !== 'boolean') {
+        return res.status(400).json({ error: 'Informe o e-mail e o status boolean "acesso_liberado"' });
+    }
+
+    try {
+        const user = await User.findOneAndUpdate(
+            { email },
+            { acesso_liberado: acesso_liberado },
+            { new: true }
+        );
+
+        if (!user) {
+            return res.status(404).json({ error: 'Usuário não encontrado' });
+        }
+
+        notifyUserUpdate(user._id, user);
+
+        return res.json({
+            success: true,
+            message: `Acesso do usuário ${user.email} alterado para: ${user.acesso_liberado}`,
+            user: {
+                id: user._id,
+                email: user.email,
+                acesso_liberado: user.acesso_liberado
+            }
+        });
+
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao atualizar liberação de acesso' });
     }
 });
 

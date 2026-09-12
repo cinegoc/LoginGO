@@ -20,7 +20,6 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// Configuração do Socket.io para comunicação em tempo real
 const io = new Server(server, {
     cors: { origin: "*" }
 });
@@ -28,17 +27,13 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-
-// ================= ROTA PÚBLICA DE STATUS (HEALTH CHECK PARA O RENDER) =================
+// ================= ROTA PÚBLICA DE STATUS =================
 app.get('/', (req, res) => {
-    return res.status(200).json({ status: 'online', message: 'Servidor LoginGO em execução' });
+    return res.status(200).json({ status: 'online', message: 'Servidor Prime Studio em execução' });
 });
 
-
 // ================= TEMPO REAL (SOCKET.IO) =================
-
 io.on('connection', (socket) => {
-    // Entrar na sala privativa do próprio usuário usando o ID
     socket.on('join_user_room', (userId) => {
         if (userId) {
             socket.join(userId.toString());
@@ -46,7 +41,13 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Permite que o app solicite a busca/sincronização forçada dos dados mais recentes
+    socket.on('join_admin_support', (userId) => {
+        if (userId) {
+            socket.join('admin_support_room');
+            console.log(`[Socket] Admin conectado ao painel de suporte: ${userId}`);
+        }
+    });
+
     socket.on('request_user_sync', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             try {
@@ -61,10 +62,6 @@ io.on('connection', (socket) => {
     });
 });
 
-/**
- * Emite a atualização INTEGRAL de todos os dados do usuário em tempo real
- * via Socket.IO para o aplicativo Android.
- */
 function notifyUserUpdate(userId, user) {
     if (!userId || !user) return;
 
@@ -75,118 +72,60 @@ function notifyUserUpdate(userId, user) {
         avatar: user.avatar || "",
         plan: user.plan || 'FREE',
         acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : false,
+        isAdmin: user.isAdmin !== undefined ? user.isAdmin : false,
         recoveryCode: user.recoveryCode || "",
         profile: user.profile || {},
         createdAt: user.createdAt || null
     };
 
-    console.log(`[Socket] Enviando user_updated para a sala ${userId.toString()}:`, userDataPayload.plan);
     io.to(userId.toString()).emit('user_updated', userDataPayload);
 }
 
-
-// ================= 1. CHAVE MESTRA DA API (HEADER KEY) =================
-
+// ================= CHAVE MESTRA DA API =================
 const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
 
 function verifyApiKey(req, res, next) {
     const clientApiKey = req.headers['x-api-key'];
-
     if (!clientApiKey || clientApiKey !== API_KEY_SECRET) {
         return res.status(403).json({ error: 'Acesso negado: Chave de API inválida ou ausente.' });
     }
     next();
 }
 
-// Aplica a validação de chave de API em todas as rotas registradas abaixo
 app.use(verifyApiKey);
-
-
-// ================= STORAGE =================
 
 const STORAGE = process.env.STORAGE || "r2";
 
-
-// ================= MONGO SCHEMA & CONNECT =================
-
+// ================= MONGO SCHEMAS =================
 const UserSchema = new mongoose.Schema({
-    email: {
-        type: String,
-        unique: true
-    },
-
+    email: { type: String, unique: true },
     password: String,
-
     name: String,
-
     avatar: String,
-
-    plan: {
-        type: String,
-        default: 'FREE'
-    },
-
-    // TRAVA DE SEGURANÇA NO BANCO DE DADOS
-    acesso_liberado: {
-        type: Boolean,
-        default: false
-    },
-
-    purchaseToken: {
-        type: String,
-        default: null
-    },
-
-    recoveryCode: {
-        type: String,
-        unique: true
-    },
-
-    profile: {
-        type: mongoose.Schema.Types.Mixed,
-        default: {}
-    },
-
-    createdAt: {
-        type: Date,
-        default: Date.now
-    }
+    plan: { type: String, default: 'FREE' },
+    acesso_liberado: { type: Boolean, default: false },
+    isAdmin: { type: Boolean, default: false },
+    purchaseToken: { type: String, default: null },
+    recoveryCode: { type: String, unique: true },
+    profile: { type: mongoose.Schema.Types.Mixed, default: {} },
+    createdAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model('User', UserSchema);
 
-mongoose.connect(process.env.MONGO_URL)
-.then(() => {
-    console.log('MongoDB conectado com sucesso');
-
-    // ================= CHANGE STREAMS (GATILHO DE TEMPO REAL NO BANCO) =================
-    try {
-        const changeStream = User.watch();
-
-        changeStream.on('change', async (change) => {
-            if (change.operationType === 'update' || change.operationType === 'replace') {
-                const updatedUserId = change.documentKey._id;
-                const fullUser = await User.findById(updatedUserId).select('-password');
-                if (fullUser) {
-                    console.log(`[ChangeStream] Alteração detectada no banco para o usuário: ${updatedUserId}`);
-                    notifyUserUpdate(updatedUserId, fullUser);
-                }
-            }
-        });
-
-        changeStream.on('error', (csError) => {
-            console.log('[ChangeStream] Notificação por log do MongoDB desativada ou não suportada sem Replica Set.');
-        });
-    } catch (csError) {
-        console.log('[ChangeStream] Notificação por log do MongoDB não suportada sem Replica Set. Usando gatilhos das rotas API.');
-    }
-})
-.catch(err => {
-    console.error('Erro ao conectar no MongoDB:', err);
+const SupportMessageSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    senderModel: { type: String, enum: ['user', 'admin'], required: true },
+    message: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now }
 });
 
+const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
 
-// ================= FUNÇÕES AUXILIARES =================
+mongoose.connect(process.env.MONGO_URL)
+.then(() => console.log('MongoDB conectado com sucesso'))
+.catch(err => console.error('Erro ao conectar no MongoDB:', err));
 
 function generateRecoveryCode() {
     const a = Math.floor(1000 + Math.random() * 9000);
@@ -198,21 +137,13 @@ async function createUniqueRecoveryCode() {
     let code;
     do {
         code = generateRecoveryCode();
-    } while (
-        await User.findOne({ recoveryCode: code })
-    );
+    } while (await User.findOne({ recoveryCode: code }));
     return code;
 }
 
-
-// ================= 2. AUTHENTICATION MIDDLEWARE (JWT USUÁRIO) =================
-
 function auth(req, res, next) {
     const token = req.headers.authorization?.replace('Bearer ', '');
-
-    if (!token) {
-        return res.status(401).json({ error: 'Token de sessão ausente' });
-    }
+    if (!token) return res.status(401).json({ error: 'Token de sessão ausente' });
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -222,9 +153,6 @@ function auth(req, res, next) {
         return res.status(401).json({ error: 'Token de sessão inválido ou expirado' });
     }
 }
-
-
-// ================= R2 / CLOUDINARY / MULTER =================
 
 const r2 = new S3Client({
     region: 'auto',
@@ -241,95 +169,21 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const upload = multer({
-    storage: multer.memoryStorage()
-});
+const upload = multer({ storage: multer.memoryStorage() });
 
-
-// ================= UPLOAD AVATAR =================
-
-app.post('/upload-avatar', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'Arquivo não enviado' });
-        }
-
-        if (STORAGE === "r2") {
-            const ext = req.file.originalname.split('.').pop();
-            const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
-
-            await r2.send(
-                new PutObjectCommand({
-                    Bucket: process.env.R2_BUCKET,
-                    Key: fileName,
-                    Body: req.file.buffer,
-                    ContentType: req.file.mimetype,
-                    CacheControl: 'public, max-age=31536000'
-                })
-            );
-
-            return res.json({
-                success: true,
-                url: `${process.env.R2_PUBLIC_URL}/${fileName}`
-            });
-        }
-
-        if (STORAGE === "cloudinary") {
-            const result = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    { folder: "avatars" },
-                    (error, result) => {
-                        if (error) reject(error);
-                        else resolve(result);
-                    }
-                );
-
-                streamifier.createReadStream(req.file.buffer).pipe(stream);
-            });
-
-            return res.json({
-                success: true,
-                url: result.secure_url
-            });
-        }
-
-        return res.status(500).json({ error: "Storage não configurado" });
-
-    } catch (err) {
-        console.error("UPLOAD ERROR:", err);
-        return res.status(500).json({ error: "Erro no upload" });
-    }
-});
-
-
-// ================= REGISTER =================
-
+// ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
-    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = false, profile = {} } = req.body;
-
-    if (!email || !password || !name) {
-        return res.status(400).json({ error: 'Preencha todos os campos' });
-    }
+    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = false, isAdmin = false, profile = {} } = req.body;
+    if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
 
     try {
         const exists = await User.findOne({ email });
-        if (exists) {
-            return res.status(400).json({ error: 'Email já cadastrado' });
-        }
+        if (exists) return res.status(400).json({ error: 'Email já cadastrado' });
 
         const hash = await bcrypt.hash(password, 10);
         const recoveryCode = await createUniqueRecoveryCode();
 
-        const user = await User.create({
-            email,
-            password: hash,
-            name,
-            avatar,
-            plan,
-            acesso_liberado,
-            recoveryCode,
-            profile
-        });
+        const user = await User.create({ email, password: hash, name, avatar, plan, acesso_liberado, isAdmin, recoveryCode, profile });
 
         return res.json({
             success: true,
@@ -341,48 +195,31 @@ app.post('/register', async (req, res) => {
                 avatar: user.avatar,
                 plan: user.plan,
                 acesso_liberado: user.acesso_liberado,
+                isAdmin: user.isAdmin,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
         });
-
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
 
-
-// ================= LOGIN =================
-
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
-
     try {
         const user = await User.findOne({ email });
-        if (!user) {
-            return res.status(400).json({ error: 'Usuário não encontrado' });
-        }
+        if (!user) return res.status(400).json({ error: 'Usuário não encontrado' });
 
         const ok = await bcrypt.compare(password, user.password);
-        if (!ok) {
-            return res.status(401).json({ error: 'Senha inválida' });
-        }
+        if (!ok) return res.status(401).json({ error: 'Senha inválida' });
 
-        // ================= TRAVA DE SEGURANÇA NO SERVIDOR =================
-        // Se no database o usuário estiver com 'acesso_liberado' como falso ou ausente,
-        // o servidor impede o login e retorna um erro.
         if (!user.acesso_liberado) {
-            return res.status(403).json({ 
-                error: 'Acesso não liberado pelo Administrador. Entre em contato para ativar sua conta.' 
-            });
+            return res.status(403).json({ error: 'Acesso não liberado pelo Administrador. Entre em contato para ativar sua conta.' });
         }
 
-        const token = jwt.sign(
-            { id: user._id },
-            process.env.JWT_SECRET,
-            { expiresIn: '30d' }
-        );
+        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
         return res.json({
             token,
@@ -393,26 +230,21 @@ app.post('/login', async (req, res) => {
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
                 acesso_liberado: user.acesso_liberado,
+                isAdmin: user.isAdmin,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
         });
-
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
-
-
-// ================= ME =================
 
 app.get('/me', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId).select('-password');
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
-        }
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
         return res.json({
             user: {
@@ -422,336 +254,108 @@ app.get('/me', auth, async (req, res) => {
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
                 acesso_liberado: user.acesso_liberado,
+                isAdmin: user.isAdmin,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
         });
-
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
 
-
-// ================= UPDATE PROFILE =================
-
-app.put('/profile', auth, async (req, res) => {
-    const { name, avatar, profile = {} } = req.body;
-
+// ================= ROTAS DE SUPORTE (CHAT) =================
+app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
     try {
-        const user = await User.findById(req.userId);
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let queryUserId = req.userId;
+        if (requestingUser.isAdmin && req.params.targetUserId) {
+            queryUserId = req.params.targetUserId;
         }
 
-        if (typeof name === 'string') {
-            user.name = name.trim();
-        }
+        const messages = await SupportMessage.find({ userId: queryUserId })
+            .sort({ createdAt: 1 })
+            .populate('senderId', 'name avatar email');
 
-        if (typeof avatar === 'string' && avatar.trim()) {
-            user.avatar = avatar;
-        }
-
-        user.profile = {
-            ...user.profile,
-            ...profile
-        };
-
-        await user.save();
-
-        // Dispara atualização universal em tempo real para o app Android
-        notifyUserUpdate(user._id, user);
-
-        return res.json({
-            success: true,
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email,
-                avatar: user.avatar,
-                plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado,
-                recoveryCode: user.recoveryCode,
-                profile: user.profile
-            }
-        });
-
+        return res.json({ success: true, messages });
     } catch (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
+        return res.status(500).json({ error: 'Erro ao buscar mensagens' });
     }
 });
 
-
-// ================= VERIFY PURCHASES (GOOGLE PLAY) =================
-
-app.post('/verify-purchase', auth, async (req, res) => {
-    const { purchaseToken, productId } = req.body;
-
-    if (!purchaseToken) {
-        return res.status(400).json({ error: 'Token de compra não enviado' });
-    }
-
+app.get('/support/admin/chats', auth, async (req, res) => {
     try {
-        const user = await User.findByIdAndUpdate(
-            req.userId,
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser || !requestingUser.isAdmin) {
+            return res.status(403).json({ error: 'Acesso negado. Apenas administradores.' });
+        }
+
+        const chats = await SupportMessage.aggregate([
+            { $sort: { createdAt: -1 } },
             {
-                plan: 'VIP',
-                purchaseToken: purchaseToken
+                $group: {
+                    _id: "$userId",
+                    lastMessage: { $first: "$message" },
+                    lastMessageDate: { $first: "$createdAt" }
+                }
             },
-            { new: true }
-        );
+            { $sort: { lastMessageDate: -1 } }
+        ]);
 
-        if (user) {
-            // Dispara atualização em tempo real para o aplicativo Android
-            notifyUserUpdate(user._id, user);
-        }
-
-        return res.json({
-            success: true,
-            message: 'Plano atualizado para VIP com sucesso!',
-            plan: user.plan
+        const populatedChats = await User.populate(chats, {
+            path: '_id',
+            select: 'name email avatar plan acesso_liberado'
         });
 
+        return res.json({ success: true, chats: populatedChats });
     } catch (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Erro ao processar compra' });
+        return res.status(500).json({ error: 'Erro ao listar chats' });
     }
 });
 
-
-// ================= VERIFY CURRENT PASSWORD =================
-
-app.post('/verify-password', auth, async (req, res) => {
-    const { currentPassword } = req.body;
-
-    if (!currentPassword) {
-        return res.status(400).json({ error: 'Senha não informada' });
-    }
+app.post('/support/message', auth, async (req, res) => {
+    const { message, targetUserId } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({ error: 'A mensagem não pode estar vazia' });
 
     try {
-        const user = await User.findById(req.userId);
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
+        const sender = await User.findById(req.userId);
+        if (!sender) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let chatUserId = sender._id;
+        let senderModel = 'user';
+
+        if (sender.isAdmin && targetUserId) {
+            chatUserId = targetUserId;
+            senderModel = 'admin';
         }
 
-        const valid = await bcrypt.compare(currentPassword, user.password);
-        return res.json({ valid });
-
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
-    }
-});
-
-
-// ================= CHANGE PASSWORD =================
-
-app.put('/change-password', auth, async (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-
-    if (!currentPassword || !newPassword) {
-        return res.status(400).json({ error: 'Preencha todos os campos' });
-    }
-
-    try {
-        const user = await User.findById(req.userId);
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
-        }
-
-        const ok = await bcrypt.compare(currentPassword, user.password);
-        if (!ok) {
-            return res.status(401).json({ error: 'Senha atual incorreta' });
-        }
-
-        user.password = await bcrypt.hash(newPassword, 10);
-        await user.save();
-
-        return res.json({
-            success: true,
-            message: 'Senha alterada com sucesso'
+        const newMessage = await SupportMessage.create({
+            userId: chatUserId,
+            senderId: sender._id,
+            senderModel: senderModel,
+            message: message.trim()
         });
 
+        const populatedMessage = await SupportMessage.findById(newMessage._id)
+            .populate('senderId', 'name avatar email');
+
+        io.to(chatUserId.toString()).emit('new_support_message', populatedMessage);
+        io.to('admin_support_room').emit('new_support_message', populatedMessage);
+
+        return res.json({ success: true, message: populatedMessage });
     } catch (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
+        return res.status(500).json({ error: 'Erro ao enviar mensagem' });
     }
 });
-
-
-// ================= CHANGE EMAIL =================
-
-app.put('/change-email', auth, async (req, res) => {
-    const { currentPassword, newEmail } = req.body;
-
-    if (!currentPassword || !newEmail) {
-        return res.status(400).json({ error: 'Preencha todos os campos' });
-    }
-
-    const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail);
-    if (!emailValid) {
-        return res.status(400).json({ error: 'E-mail inválido' });
-    }
-
-    try {
-        const user = await User.findById(req.userId);
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
-        }
-
-        const ok = await bcrypt.compare(currentPassword, user.password);
-        if (!ok) {
-            return res.status(401).json({ error: 'Senha atual incorreta' });
-        }
-
-        const exists = await User.findOne({ email: newEmail });
-        if (exists && exists._id.toString() !== user._id.toString()) {
-            return res.status(400).json({ error: 'Este e-mail já está em uso' });
-        }
-
-        user.email = newEmail.trim();
-        await user.save();
-
-        // Dispara atualização em tempo real para o app Android
-        notifyUserUpdate(user._id, user);
-
-        return res.json({
-            success: true,
-            message: 'E-mail alterado com sucesso',
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email,
-                avatar: user.avatar,
-                plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado,
-                recoveryCode: user.recoveryCode,
-                profile: user.profile
-            }
-        });
-
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
-    }
-});
-
-
-// ================= RECOVER WITH CODE =================
-
-app.post('/recover-with-code', async (req, res) => {
-    const { email, recoveryCode, newPassword } = req.body;
-
-    if (!email || !recoveryCode || !newPassword) {
-        return res.status(400).json({ error: 'Preencha todos os campos' });
-    }
-
-    try {
-        const user = await User.findOne({ email, recoveryCode });
-        if (!user) {
-            return res.status(400).json({ error: 'Código inválido' });
-        }
-
-        user.password = await bcrypt.hash(newPassword, 10);
-        await user.save();
-
-        return res.json({
-            success: true,
-            message: 'Senha redefinida com sucesso'
-        });
-
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
-    }
-});
-
-
-// ================= ADMIN: ALTERAR PLANO DE USUÁRIO (TESTES) =================
-
-app.put('/admin/change-plan', async (req, res) => {
-    const { email, plan } = req.body;
-
-    if (!email || !plan) {
-        return res.status(400).json({ error: 'Preencha e-mail e plano ("VIP" ou "FREE")' });
-    }
-
-    try {
-        const user = await User.findOneAndUpdate(
-            { email },
-            { plan: plan.toUpperCase() },
-            { new: true }
-        );
-
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
-        }
-
-        // Dispara atualização universal em tempo real para o app
-        notifyUserUpdate(user._id, user);
-
-        return res.json({
-            success: true,
-            message: `Plano do usuário ${user.email} alterado para ${user.plan}`,
-            user: {
-                id: user._id,
-                email: user.email,
-                plan: user.plan
-            }
-        });
-
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro ao alterar plano' });
-    }
-});
-
-
-// ================= ADMIN: LIBERAR OU BLOQUEAR ACESSO DO USUÁRIO =================
-
-app.put('/admin/toggle-access', async (req, res) => {
-    const { email, acesso_liberado } = req.body;
-
-    if (!email || typeof acesso_liberado !== 'boolean') {
-        return res.status(400).json({ error: 'Informe o e-mail e o status boolean "acesso_liberado"' });
-    }
-
-    try {
-        const user = await User.findOneAndUpdate(
-            { email },
-            { acesso_liberado: acesso_liberado },
-            { new: true }
-        );
-
-        if (!user) {
-            return res.status(404).json({ error: 'Usuário não encontrado' });
-        }
-
-        notifyUserUpdate(user._id, user);
-
-        return res.json({
-            success: true,
-            message: `Acesso do usuário ${user.email} alterado para: ${user.acesso_liberado}`,
-            user: {
-                id: user._id,
-                email: user.email,
-                acesso_liberado: user.acesso_liberado
-            }
-        });
-
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro ao atualizar liberação de acesso' });
-    }
-});
-
 
 // ================= START =================
-
 const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor protegido e em tempo real rodando na porta ${PORT}`);
+    console.log(`Servidor Prime Studio rodando na porta ${PORT}`);
 });

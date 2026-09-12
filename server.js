@@ -123,8 +123,39 @@ const SupportMessageSchema = new mongoose.Schema({
 
 const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
 
+// Conexão com Auto-Injeção de Dados de Teste caso o banco esteja vazio
 mongoose.connect(process.env.MONGO_URL)
-.then(() => console.log('MongoDB conectado com sucesso'))
+.then(async () => {
+    console.log('MongoDB conectado com sucesso');
+    try {
+        const totalMensagens = await SupportMessage.countDocuments();
+        if (totalMensagens === 0) {
+            const testUserId = new mongoose.Types.ObjectId("650f1a2b3c4d5e6f7a8b9c01");
+            let userExistente = await User.findById(testUserId);
+            if (!userExistente) {
+                await User.create({
+                    _id: testUserId,
+                    email: "cliente.teste@email.com",
+                    password: "$2a$10$fictitioushashforclienttest",
+                    name: "João Teste (Cliente)",
+                    plan: "PRO",
+                    acesso_liberado: true,
+                    isAdmin: false,
+                    recoveryCode: "SG-1111-2222"
+                });
+            }
+            await SupportMessage.create({
+                userId: testUserId,
+                senderId: testUserId,
+                senderModel: "user",
+                message: "Olá! Esta é uma mensagem de teste automática para o chat funcionar!"
+            });
+            console.log('>>> MENSAGEM E USUÁRIO DE TESTE CRIADOS COM SUCESSO NO BANCO! <<<');
+        }
+    } catch (e) {
+        console.error('Erro ao criar dados de teste:', e);
+    }
+})
 .catch(err => console.error('Erro ao conectar no MongoDB:', err));
 
 function generateRecoveryCode() {

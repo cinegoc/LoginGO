@@ -71,8 +71,7 @@ function notifyUserUpdate(userId, user) {
         email: user.email || "",
         avatar: user.avatar || "",
         plan: user.plan || 'FREE',
-        acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
-        isAdmin: user.isAdmin !== undefined ? user.isAdmin : false,
+        studio: user.studio !== undefined ? user.studio : false,
         recoveryCode: user.recoveryCode || "",
         profile: user.profile || {},
         createdAt: user.createdAt || null
@@ -103,8 +102,7 @@ const UserSchema = new mongoose.Schema({
     name: String,
     avatar: String,
     plan: { type: String, default: 'FREE' },
-    acesso_liberado: { type: Boolean, default: true },
-    isAdmin: { type: Boolean, default: false },
+    studio: { type: Boolean, default: false }, // Tag única de restrição: padrão false
     purchaseToken: { type: String, default: null },
     recoveryCode: { type: String, unique: true },
     profile: { type: mongoose.Schema.Types.Mixed, default: {} },
@@ -139,8 +137,7 @@ mongoose.connect(process.env.MONGO_URL)
                     password: "$2a$10$fictitioushashforclienttest",
                     name: "João Teste (Cliente)",
                     plan: "PRO",
-                    acesso_liberado: true,
-                    isAdmin: false,
+                    studio: true, // Apenas para teste inicial do chat
                     recoveryCode: "SG-1111-2222"
                 });
             }
@@ -248,7 +245,8 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
 
 // ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
-    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = true, isAdmin = false, profile = {} } = req.body;
+    // Toda nova conta nasce por padrão com studio = false
+    const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
 
     try {
@@ -258,7 +256,16 @@ app.post('/register', async (req, res) => {
         const hash = await bcrypt.hash(password, 10);
         const recoveryCode = await createUniqueRecoveryCode();
 
-        const user = await User.create({ email, password: hash, name, avatar, plan, acesso_liberado, isAdmin, recoveryCode, profile });
+        const user = await User.create({ 
+            email, 
+            password: hash, 
+            name, 
+            avatar, 
+            plan, 
+            studio: false, // Forçado obrigatoriamente como false no cadastro
+            recoveryCode, 
+            profile 
+        });
 
         return res.json({
             success: true,
@@ -269,8 +276,7 @@ app.post('/register', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan,
-                acesso_liberado: user.acesso_liberado,
-                isAdmin: user.isAdmin,
+                studio: user.studio,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -281,7 +287,7 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Rota de login sem barreiras no servidor: permite acesso livre e envia as tags para validação condicional no app/painel
+// Rota de login enviando o parâmetro 'studio' para checagem rigorosa
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -301,8 +307,7 @@ app.post('/login', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
-                isAdmin: user.isAdmin || false,
+                studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -325,8 +330,7 @@ app.get('/me', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
-                isAdmin: user.isAdmin || false,
+                studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -520,7 +524,7 @@ app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
         if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
 
         let queryUserId = req.userId;
-        if (requestingUser.isAdmin && req.params.targetUserId) {
+        if (requestingUser.studio && req.params.targetUserId) {
             queryUserId = req.params.targetUserId;
         }
 
@@ -538,8 +542,8 @@ app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
 app.get('/support/admin/chats', auth, async (req, res) => {
     try {
         const requestingUser = await User.findById(req.userId);
-        if (!requestingUser || !requestingUser.isAdmin) {
-            return res.status(403).json({ error: 'Acesso negado. Apenas administradores.' });
+        if (!requestingUser || !requestingUser.studio) {
+            return res.status(403).json({ error: 'Acesso negado. Apenas estúdio autorizado.' });
         }
 
         const chats = await SupportMessage.aggregate([
@@ -556,7 +560,7 @@ app.get('/support/admin/chats', auth, async (req, res) => {
 
         const populatedChats = await User.populate(chats, {
             path: '_id',
-            select: 'name email avatar plan acesso_liberado'
+            select: 'name email avatar plan studio'
         });
 
         return res.json({ success: true, chats: populatedChats });
@@ -577,7 +581,7 @@ app.post('/support/message', auth, async (req, res) => {
         let chatUserId = sender._id;
         let senderModel = 'user';
 
-        if (sender.isAdmin && targetUserId) {
+        if (sender.studio && targetUserId) {
             chatUserId = targetUserId;
             senderModel = 'admin';
         }

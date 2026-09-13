@@ -71,7 +71,7 @@ function notifyUserUpdate(userId, user) {
         email: user.email || "",
         avatar: user.avatar || "",
         plan: user.plan || 'FREE',
-        acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : false,
+        acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
         isAdmin: user.isAdmin !== undefined ? user.isAdmin : false,
         recoveryCode: user.recoveryCode || "",
         profile: user.profile || {},
@@ -281,6 +281,7 @@ app.post('/register', async (req, res) => {
     }
 });
 
+// Rota de login sem barreiras no servidor: permite acesso livre e envia as tags para validação condicional no app/painel
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -289,10 +290,6 @@ app.post('/login', async (req, res) => {
 
         const ok = await bcrypt.compare(password, user.password);
         if (!ok) return res.status(401).json({ error: 'Senha inválida' });
-
-        if (user.acesso_liberado === false) {
-            return res.status(403).json({ error: 'Acesso não liberado pelo Administrador. Entre em contato para ativar sua conta.' });
-        }
 
         const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
@@ -304,8 +301,8 @@ app.post('/login', async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado,
-                isAdmin: user.isAdmin,
+                acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
+                isAdmin: user.isAdmin || false,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -328,8 +325,8 @@ app.get('/me', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
-                acesso_liberado: user.acesso_liberado,
-                isAdmin: user.isAdmin,
+                acesso_liberado: user.acesso_liberado !== undefined ? user.acesso_liberado : true,
+                isAdmin: user.isAdmin || false,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }

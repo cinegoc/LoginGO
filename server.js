@@ -29,7 +29,7 @@ app.use(express.json());
 
 // ================= ROTA PÚBLICA DE STATUS =================
 app.get('/', (req, res) => {
-    return res.status(200).json({ status: 'online', message: 'Servidor Prime Studio em execução' });
+    return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
 // ================= TEMPO REAL (SOCKET.IO) =================
@@ -103,7 +103,7 @@ const UserSchema = new mongoose.Schema({
     name: String,
     avatar: String,
     plan: { type: String, default: 'FREE' },
-    acesso_liberado: { type: Boolean, default: false },
+    acesso_liberado: { type: Boolean, default: true },
     isAdmin: { type: Boolean, default: false },
     purchaseToken: { type: String, default: null },
     recoveryCode: { type: String, unique: true },
@@ -123,7 +123,7 @@ const SupportMessageSchema = new mongoose.Schema({
 
 const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
 
-// Conexão com Auto-Injeção de Dados de Teste caso o banco esteja vazio
+// Conexão com MongoDB
 mongoose.connect(process.env.MONGO_URL)
 .then(async () => {
     console.log('MongoDB conectado com sucesso');
@@ -202,9 +202,53 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ================= UPLOAD AVATAR =================
+app.post('/upload-avatar', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
+
+        if (STORAGE === "r2") {
+            const ext = req.file.originalname.split('.').pop();
+            const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
+            await r2.send(
+                new PutObjectCommand({
+                    Bucket: process.env.R2_BUCKET,
+                    Key: fileName,
+                    Body: req.file.buffer,
+                    ContentType: req.file.mimetype,
+                    CacheControl: 'public, max-age=31536000'
+                })
+            );
+
+            return res.json({ success: true, url: `${process.env.R2_PUBLIC_URL}/${fileName}` });
+        }
+
+        if (STORAGE === "cloudinary") {
+            const result = await new Promise((resolve, reject) => {
+                const stream = cloudinary.uploader.upload_stream(
+                    { folder: "avatars" },
+                    (error, result) => {
+                        if (error) reject(error);
+                        else resolve(result);
+                    }
+                );
+                streamifier.createReadStream(req.file.buffer).pipe(stream);
+            });
+
+            return res.json({ success: true, url: result.secure_url });
+        }
+
+        return res.status(500).json({ error: "Storage não configurado" });
+    } catch (err) {
+        console.error("UPLOAD ERROR:", err);
+        return res.status(500).json({ error: "Erro no upload" });
+    }
+});
+
 // ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
-    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = false, isAdmin = false, profile = {} } = req.body;
+    const { email, password, name, avatar, plan = 'FREE', acesso_liberado = true, isAdmin = false, profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
 
     try {
@@ -246,7 +290,7 @@ app.post('/login', async (req, res) => {
         const ok = await bcrypt.compare(password, user.password);
         if (!ok) return res.status(401).json({ error: 'Senha inválida' });
 
-        if (!user.acesso_liberado) {
+        if (user.acesso_liberado === false) {
             return res.status(403).json({ error: 'Acesso não liberado pelo Administrador. Entre em contato para ativar sua conta.' });
         }
 
@@ -293,6 +337,182 @@ app.get('/me', auth, async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/profile', auth, async (req, res) => {
+    const { name, avatar, profile = {} } = req.body;
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        if (typeof name === 'string') user.name = name.trim();
+        if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
+
+        user.profile = { ...user.profile, ...profile };
+        await user.save();
+
+        return res.json({
+            success: true,
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                recoveryCode: user.recoveryCode,
+                profile: user.profile
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+// ================= VERIFY PURCHASES (GOOGLE PLAY) =================
+app.post('/verify-purchase', auth, async (req, res) => {
+    const { purchaseToken } = req.body;
+    if (!purchaseToken) return res.status(400).json({ error: 'Token de compra não enviado' });
+
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.userId,
+            { plan: 'VIP', purchaseToken: purchaseToken },
+            { new: true }
+        );
+
+        return res.json({
+            success: true,
+            message: 'Plano atualizado para VIP com sucesso!',
+            plan: user.plan
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao processar compra' });
+    }
+});
+
+// ================= SENHAS E SEGURANÇA =================
+app.post('/verify-password', auth, async (req, res) => {
+    const { currentPassword } = req.body;
+    if (!currentPassword) return res.status(400).json({ error: 'Senha não informada' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const valid = await bcrypt.compare(currentPassword, user.password);
+        return res.json({ valid });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-password', auth, async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha alterada com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-email', auth, async (req, res) => {
+    const { currentPassword, newEmail } = req.body;
+    if (!currentPassword || !newEmail) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+        return res.status(400).json({ error: 'E-mail inválido' });
+    }
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        const exists = await User.findOne({ email: newEmail });
+        if (exists && exists._id.toString() !== user._id.toString()) {
+            return res.status(400).json({ error: 'Este e-mail já está em uso' });
+        }
+
+        user.email = newEmail.trim();
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'E-mail alterado com sucesso',
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                recoveryCode: user.recoveryCode,
+                profile: user.profile
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.post('/recover-with-code', async (req, res) => {
+    const { email, recoveryCode, newPassword } = req.body;
+    if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const user = await User.findOne({ email, recoveryCode });
+        if (!user) return res.status(400).json({ error: 'Código inválido' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha redefinida com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+// ================= ADMIN: ALTERAR PLANO =================
+app.put('/admin/change-plan', async (req, res) => {
+    const { email, plan } = req.body;
+    if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
+
+    try {
+        const user = await User.findOneAndUpdate(
+            { email },
+            { plan: plan.toUpperCase() },
+            { new: true }
+        );
+
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            message: `Plano alterado para ${user.plan}`,
+            user: { id: user._id, email: user.email, plan: user.plan }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao alterar plano' });
     }
 });
 
@@ -388,5 +608,5 @@ app.post('/support/message', auth, async (req, res) => {
 // ================= START =================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor Prime Studio rodando na porta ${PORT}`);
+    console.log(`Servidor unificado do Prime Studio rodando na porta ${PORT}`);
 });

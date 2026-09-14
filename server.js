@@ -31,36 +31,46 @@ app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
+// Mapas de controle separados para usuários comuns e agentes de suporte (studio: true)
 const userActiveSockets = new Map();
+const agentActiveSockets = new Map();
 
-async function setOfflineUser(userId, ioInstance) {
+async function setOfflineUser(userId, ioInstance, isAgent = false) {
     if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
     const uIdStr = userId.toString();
 
-    if (userActiveSockets.has(uIdStr)) {
+    if (isAgent) {
+        agentActiveSockets.delete(uIdStr);
+    } else {
         userActiveSockets.delete(uIdStr);
     }
 
     const lastSeen = new Date();
     try {
+        const user = await User.findById(uIdStr);
+        if (!user) return;
+
+        // Se for agente, só marca offline globalmente se não restar nenhuma aba/conexão de agente ativa
+        if (user.studio) {
+            const totalAgentSockets = Array.from(agentActiveSockets.values()).reduce((acc, set) => acc + set.size, 0);
+            if (totalAgentSockets > 0) return; 
+        }
+
         await User.findByIdAndUpdate(uIdStr, { isOnline: false, lastSeen });
         const formattedLastSeen = lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-        ioInstance.to('admin_support_room').emit('user_status_changed', { 
-            userId: uIdStr, 
-            isOnline: false, 
-            lastSeen: formattedLastSeen 
-        });
-        ioInstance.to(uIdStr).emit('user_status_changed', { 
-            userId: uIdStr, 
-            isOnline: false, 
-            lastSeen: formattedLastSeen 
-        });
-        ioInstance.emit('support_status', { 
-            userId: uIdStr, 
-            isOnline: false, 
-            lastSeen: formattedLastSeen 
-        });
+        if (user.studio) {
+            ioInstance.emit('support_status', { 
+                userId: uIdStr, 
+                isOnline: false, 
+                lastSeen: formattedLastSeen,
+                agentName: "",
+                agentAvatar: ""
+            });
+        } else {
+            ioInstance.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: false, lastSeen: formattedLastSeen });
+            ioInstance.to(uIdStr).emit('user_status_changed', { userId: uIdStr, isOnline: false, lastSeen: formattedLastSeen });
+        }
     } catch (e) {
         console.error('[Socket] Erro crítico ao persistir status offline:', e);
     }
@@ -82,10 +92,12 @@ io.on('connection', (socket) => {
             userActiveSockets.get(uIdStr).add(socket.id);
 
             try {
-                await User.findByIdAndUpdate(uIdStr, { isOnline: true });
-                io.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
-                io.to(`user_${uIdStr}`).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
-                io.emit('support_status', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                const user = await User.findById(uIdStr);
+                if (user && !user.studio) {
+                    await User.findByIdAndUpdate(uIdStr, { isOnline: true });
+                    io.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                    io.to(`user_${uIdStr}`).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                }
             } catch (e) {
                 console.error('[Socket] Erro ao atualizar status online do usuário:', e);
             }
@@ -102,14 +114,23 @@ io.on('connection', (socket) => {
             socket.join(`user_${uIdStr}`);
             socket.join(uIdStr);
 
-            if (!userActiveSockets.has(uIdStr)) {
-                userActiveSockets.set(uIdStr, new Set());
+            if (!agentActiveSockets.has(uIdStr)) {
+                agentActiveSockets.set(uIdStr, new Set());
             }
-            userActiveSockets.get(uIdStr).add(socket.id);
+            agentActiveSockets.get(uIdStr).add(socket.id);
 
             try {
-                await User.findByIdAndUpdate(uIdStr, { isOnline: true });
-                io.emit('support_status', { userId: uIdStr, isOnline: true });
+                const adminUser = await User.findById(uIdStr);
+                if (adminUser && adminUser.studio) {
+                    await User.findByIdAndUpdate(uIdStr, { isOnline: true });
+                    io.emit('support_status', { 
+                        userId: uIdStr, 
+                        isOnline: true, 
+                        lastSeen: "",
+                        agentName: adminUser.name,
+                        agentAvatar: adminUser.avatar
+                    });
+                }
             } catch (e) {
                 console.error('[Socket] Erro ao atualizar status online do admin:', e);
             }
@@ -165,37 +186,56 @@ io.on('connection', (socket) => {
         }
     });
 
+    // 7. Buscar status do suporte com checagem rigorosa de agente ativo real
     socket.on('get_support_status', async (userId) => {
-        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-            try {
-                const targetUser = await User.findById(userId);
-                let isAgentOnline = false;
-                for (let [uId, socketSet] of userActiveSockets.entries()) {
-                    const u = await User.findById(uId);
-                    if (u && u.studio && socketSet.size > 0) {
-                        isAgentOnline = true;
+        try {
+            let activeAgent = null;
+            for (let [agId, socketSet] of agentActiveSockets.entries()) {
+                if (socketSet.size > 0) {
+                    const agUser = await User.findById(agId);
+                    if (agUser && agUser.studio) {
+                        activeAgent = agUser;
                         break;
                     }
                 }
-
-                socket.emit('support_status', {
-                    userId: userId.toString(),
-                    isOnline: isAgentOnline,
-                    lastSeen: targetUser && targetUser.lastSeen ? targetUser.lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""
-                });
-            } catch (e) {
-                console.error('[Socket] Erro ao buscar status do suporte:', e);
             }
+
+            if (activeAgent) {
+                socket.emit('support_status', {
+                    isOnline: true,
+                    lastSeen: "",
+                    agentName: activeAgent.name,
+                    agentAvatar: activeAgent.avatar
+                });
+            } else {
+                socket.emit('support_status', {
+                    isOnline: false,
+                    lastSeen: "Offline",
+                    agentName: "Suporte Cine GO!",
+                    agentAvatar: ""
+                });
+            }
+        } catch (e) {
+            console.error('[Socket] Erro ao buscar status do suporte:', e);
         }
     });
 
     socket.on('disconnect', async () => {
+        // Varre sockets de usuários comuns
         for (let [userId, socketSet] of userActiveSockets.entries()) {
             if (socketSet.has(socket.id)) {
                 socketSet.delete(socket.id);
                 if (socketSet.size === 0) {
-                    await setOfflineUser(userId, io);
+                    await setOfflineUser(userId, io, false);
                 }
+                break;
+            }
+        }
+        // Varre sockets de agentes/admins
+        for (let [adminId, socketSet] of agentActiveSockets.entries()) {
+            if (socketSet.has(socket.id)) {
+                socketSet.delete(socket.id);
+                await setOfflineUser(adminId, io, true);
                 break;
             }
         }
@@ -696,33 +736,28 @@ app.get('/support/admin/chats', auth, async (req, res) => {
     }
 });
 
-// ================= Rota POST /support/message integrada exatamente como especificado =================
 app.post('/support/message', auth, async (req, res) => {
     try {
         const { message, targetUserId } = req.body;
         const senderId = req.userId;
-        
+
         const sender = await User.findById(senderId);
         if (!sender) return res.status(404).json({ error: 'Usuário não encontrado' });
 
         const isAdmin = sender.studio === true; 
 
-        // Salva no MongoDB/Banco de Dados...
         const newMessage = await SupportMessage.create({
             userId: isAdmin ? targetUserId : senderId,
             senderId,
             senderModel: isAdmin ? 'admin' : 'user',
             message,
-            targetUserId: isAdmin ? targetUserId : senderId,
             status: 'sent',
             createdAt: new Date()
         });
 
-        // Popula os dados do remetente para a interface
         const populatedMessage = await SupportMessage.findById(newMessage._id)
             .populate('senderId', 'name avatar email isOnline lastSeen');
 
-        // Emite via Socket.IO em tempo real para a sala correta
         if (isAdmin) {
             io.to(`user_${targetUserId}`).emit('new_support_message', populatedMessage);
             io.to('admin_support_room').emit('new_support_message', populatedMessage);

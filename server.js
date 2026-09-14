@@ -196,6 +196,7 @@ app.use(verifyApiKey);
 
 const STORAGE = process.env.STORAGE || "r2";
 
+// ================= MONGO SCHEMAS =================
 const UserSchema = new mongoose.Schema({
     email: { type: String, unique: true },
     password: String,
@@ -225,9 +226,38 @@ const SupportMessageSchema = new mongoose.Schema({
 
 const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
 
+// Conexão com MongoDB
 mongoose.connect(process.env.MONGO_URL)
 .then(async () => {
     console.log('MongoDB conectado com sucesso');
+    try {
+        const totalMensagens = await SupportMessage.countDocuments();
+        if (totalMensagens === 0) {
+            const testUserId = new mongoose.Types.ObjectId("650f1a2b3c4d5e6f7a8b9c01");
+            let userExistente = await User.findById(testUserId);
+            if (!userExistente) {
+                await User.create({
+                    _id: testUserId,
+                    email: "cliente.teste@email.com",
+                    password: "$2a$10$fictitioushashforclienttest",
+                    name: "João Teste (Cliente)",
+                    plan: "PRO",
+                    studio: true,
+                    recoveryCode: "SG-1111-2222"
+                });
+            }
+            await SupportMessage.create({
+                userId: testUserId,
+                senderId: testUserId,
+                senderModel: "user",
+                message: "Olá! Esta é uma mensagem de teste automática para o chat funcionar!",
+                status: "sent"
+            });
+            console.log('>>> MENSAGEM E USUÁRIO DE TESTE CRIADOS COM SUCESSO NO BANCO! <<<');
+        }
+    } catch (e) {
+        console.error('Erro ao criar dados de teste:', e);
+    }
 })
 .catch(err => console.error('Erro ao conectar no MongoDB:', err));
 
@@ -275,12 +305,15 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ================= UPLOAD AVATAR =================
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
+
         if (STORAGE === "r2") {
             const ext = req.file.originalname.split('.').pop();
             const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
             await r2.send(
                 new PutObjectCommand({
                     Bucket: process.env.R2_BUCKET,
@@ -290,8 +323,10 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
                     CacheControl: 'public, max-age=31536000'
                 })
             );
+
             return res.json({ success: true, url: `${process.env.R2_PUBLIC_URL}/${fileName}` });
         }
+
         if (STORAGE === "cloudinary") {
             const result = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream(
@@ -303,14 +338,18 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
                 );
                 streamifier.createReadStream(req.file.buffer).pipe(stream);
             });
+
             return res.json({ success: true, url: result.secure_url });
         }
+
         return res.status(500).json({ error: "Storage não configurado" });
     } catch (err) {
+        console.error("UPLOAD ERROR:", err);
         return res.status(500).json({ error: "Erro no upload" });
     }
 });
 
+// ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
     const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
@@ -322,13 +361,35 @@ app.post('/register', async (req, res) => {
         const hash = await bcrypt.hash(password, 10);
         const recoveryCode = await createUniqueRecoveryCode();
 
-        const user = await User.create({ email, password: hash, name, avatar, plan, studio: false, recoveryCode, profile });
+        const user = await User.create({ 
+            email, 
+            password: hash, 
+            name, 
+            avatar, 
+            plan, 
+            studio: false, 
+            recoveryCode, 
+            profile 
+        });
+
         return res.json({
             success: true,
             recoveryCode,
-            user: { id: user._id, name: user.name, email: user.email, avatar: user.avatar, plan: user.plan, studio: user.studio, recoveryCode: user.recoveryCode, profile: user.profile, isOnline: user.isOnline, lastSeen: user.lastSeen }
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan,
+                studio: user.studio,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
         });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
@@ -343,11 +404,24 @@ app.post('/login', async (req, res) => {
         if (!ok) return res.status(401).json({ error: 'Senha inválida' });
 
         const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
         return res.json({
             token,
-            user: { id: user._id, name: user.name, email: user.email, avatar: user.avatar, plan: user.plan || 'FREE', studio: user.studio !== undefined ? user.studio : false, recoveryCode: user.recoveryCode, profile: user.profile, isOnline: user.isOnline, lastSeen: user.lastSeen }
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
         });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
@@ -356,10 +430,23 @@ app.get('/me', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId).select('-password');
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
         return res.json({
-            user: { id: user._id, name: user.name, email: user.email, avatar: user.avatar, plan: user.plan || 'FREE', studio: user.studio !== undefined ? user.studio : false, recoveryCode: user.recoveryCode, profile: user.profile, isOnline: user.isOnline, lastSeen: user.lastSeen }
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
         });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
@@ -372,18 +459,195 @@ app.put('/profile', auth, async (req, res) => {
 
         if (typeof name === 'string') user.name = name.trim();
         if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
+
         user.profile = { ...user.profile, ...profile };
         await user.save();
 
         return res.json({
             success: true,
-            user: { id: user._id, name: user.name, email: user.email, avatar: user.avatar, plan: user.plan || 'FREE', recoveryCode: user.recoveryCode, profile: user.profile, isOnline: user.isOnline, lastSeen: user.lastSeen }
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
         });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
 
+// Rota extra para consultar presença de qualquer usuário em tempo real
+app.get('/user/presence/:userId', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.userId).select('isOnline lastSeen name avatar');
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            presence: {
+                isOnline: user.isOnline || false,
+                lastSeen: user.lastSeen || null
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ error: 'Erro ao buscar presença' });
+    }
+});
+
+// ================= VERIFY PURCHASES (GOOGLE PLAY) =================
+app.post('/verify-purchase', auth, async (req, res) => {
+    const { purchaseToken } = req.body;
+    if (!purchaseToken) return res.status(400).json({ error: 'Token de compra não enviado' });
+
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.userId,
+            { plan: 'VIP', purchaseToken: purchaseToken },
+            { new: true }
+        );
+
+        return res.json({
+            success: true,
+            message: 'Plano atualizado para VIP com sucesso!',
+            plan: user.plan
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao processar compra' });
+    }
+});
+
+// ================= SENHAS E SEGURANÇA =================
+app.post('/verify-password', auth, async (req, res) => {
+    const { currentPassword } = req.body;
+    if (!currentPassword) return res.status(400).json({ error: 'Senha não informada' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const valid = await bcrypt.compare(currentPassword, user.password);
+        return res.json({ valid });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-password', auth, async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha alterada com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-email', auth, async (req, res) => {
+    const { currentPassword, newEmail } = req.body;
+    if (!currentPassword || !newEmail) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+        return res.status(400).json({ error: 'E-mail inválido' });
+    }
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        const exists = await User.findOne({ email: newEmail });
+        if (exists && exists._id.toString() !== user._id.toString()) {
+            return res.status(400).json({ error: 'Este e-mail já está em uso' });
+        }
+
+        user.email = newEmail.trim();
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'E-mail alterado com sucesso',
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                recoveryCode: user.recoveryCode,
+                profile: user.profile
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.post('/recover-with-code', async (req, res) => {
+    const { email, recoveryCode, newPassword } = req.body;
+    if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const user = await User.findOne({ email, recoveryCode });
+        if (!user) return res.status(400).json({ error: 'Código inválido' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha redefinida com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+// ================= ADMIN: ALTERAR PLANO =================
+app.put('/admin/change-plan', async (req, res) => {
+    const { email, plan } = req.body;
+    if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
+
+    try {
+        const user = await User.findOneAndUpdate(
+            { email },
+            { plan: plan.toUpperCase() },
+            { new: true }
+        );
+
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            message: `Plano alterado para ${user.plan}`,
+            user: { id: user._id, email: user.email, plan: user.plan }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao alterar plano' });
+    }
+});
+
+// ================= ROTAS DE SUPORTE (CHAT NATIVO COM SELOS E DATAS) =================
 app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
     try {
         const requestingUser = await User.findById(req.userId);
@@ -400,6 +664,7 @@ app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
 
         return res.json({ success: true, messages });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro ao buscar mensagens' });
     }
 });
@@ -408,7 +673,7 @@ app.get('/support/admin/chats', auth, async (req, res) => {
     try {
         const requestingUser = await User.findById(req.userId);
         if (!requestingUser || !requestingUser.studio) {
-            return res.status(403).json({ error: 'Acesso negado.' });
+            return res.status(403).json({ error: 'Acesso negado. Apenas estúdio autorizado.' });
         }
 
         const chats = await SupportMessage.aggregate([
@@ -443,7 +708,8 @@ app.get('/support/admin/chats', auth, async (req, res) => {
         });
 
         return res.json({ success: true, chats: populatedChats });
-    } catch (err) {
+    } catch (err)  {
+        console.error(err);
         return res.status(500).json({ error: 'Erro ao listar chats' });
     }
 });
@@ -481,11 +747,42 @@ app.post('/support/message', auth, async (req, res) => {
 
         return res.json({ success: true, message: populatedMessage });
     } catch (err) {
+        console.error(err);
         return res.status(500).json({ error: 'Erro ao enviar mensagem' });
     }
 });
 
+// Rota HTTP para confirmação de leitura via API
+app.post('/support/read', auth, async (req, res) => {
+    const { targetUserId } = req.body;
+    try {
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let chatUserId = req.userId;
+        if (requestingUser.studio && targetUserId) {
+            chatUserId = targetUserId;
+        }
+
+        const now = new Date();
+        await SupportMessage.updateMany(
+            { userId: chatUserId, senderId: { $ne: req.userId }, status: { $ne: 'read' } },
+            { $set: { status: 'read', readAt: now } }
+        );
+
+        const payload = { userId: chatUserId, readerId: req.userId, status: 'read', readAt: now };
+        io.to(chatUserId.toString()).emit('messages_read', payload);
+        io.to('admin_support_room').emit('messages_read', payload);
+
+        return res.json({ success: true, readAt: now });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao marcar mensagens como lidas' });
+    }
+});
+
+// ================= START =================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor unificado rodando na porta ${PORT}`);
+    console.log(`Servidor unificado do Prime Studio rodando na porta ${PORT}`);
 });

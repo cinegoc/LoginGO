@@ -27,15 +27,12 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// ================= ROTA PÚBLICA DE STATUS =================
 app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
-// Mapa rigoroso para controle de sockets ativos: Map<userId, Set<socketId>>
 const userActiveSockets = new Map();
 
-// Função auxiliar centralizada para forçar o status offline de forma atômica
 async function setOfflineUser(userId, ioInstance) {
     if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
     const uIdStr = userId.toString();
@@ -107,15 +104,19 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Sincronizado para disparar tanto 'user_typing' quanto 'typing_status' para o Admin
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
-            io.to('admin_support_room').emit('typing_status', { 
+            const payload = { 
                 userId: data.userId.toString(), 
                 isTyping: Boolean(data.isTyping) 
-            });
+            };
+            io.to('admin_support_room').emit('user_typing', payload);
+            io.to('admin_support_room').emit('typing_status', payload);
         }
     });
 
+    // Sincronizado para disparar 'support_typing' para o Usuário específico
     socket.on('support_typing', (data) => {
         if (data && data.userId) {
             io.to(data.userId.toString()).emit('support_typing', { 
@@ -138,6 +139,7 @@ io.on('connection', (socket) => {
 
         try {
             const now = new Date();
+            // Marca como lida apenas as mensagens do chat que NÃO são do próprio leitor
             await SupportMessage.updateMany(
                 { userId: uId, status: { $ne: 'read' } },
                 { $set: { status: 'read', readAt: now } }
@@ -202,7 +204,6 @@ app.use(verifyApiKey);
 
 const STORAGE = process.env.STORAGE || "r2";
 
-// ================= MONGO SCHEMAS =================
 const UserSchema = new mongoose.Schema({
     email: { type: String, unique: true },
     password: String,
@@ -711,7 +712,6 @@ app.post('/support/message', auth, async (req, res) => {
         const populatedMessage = await SupportMessage.findById(newMessage._id)
             .populate('senderId', 'name avatar email isOnline lastSeen');
 
-        // Emissão limpa e centralizada para evitar duplicidades de escuta no cliente
         io.to(chatUserId.toString()).emit('new_support_message', populatedMessage);
         io.to('admin_support_room').emit('new_support_message', populatedMessage);
 
@@ -750,7 +750,6 @@ app.post('/support/read', auth, async (req, res) => {
     }
 });
 
-// ================= START =================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Servidor unificado do Prime Studio rodando na porta ${PORT}`);

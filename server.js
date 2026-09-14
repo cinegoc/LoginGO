@@ -32,22 +32,105 @@ app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
+// Map para controle de conexões ativas do Socket (socket.id -> userId)
+const connectedUsers = new Map();
+
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
-    socket.on('join_user_room', (userId) => {
-        if (userId) {
-            socket.join(userId.toString());
-            console.log(`[Socket] Usuário conectado à sala privativa: ${userId}`);
+    
+    // Conexão do Usuário
+    socket.on('join_user_room', async (userId) => {
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+            const uIdStr = userId.toString();
+            socket.join(uIdStr);
+            connectedUsers.set(socket.id, uIdStr);
+            console.log(`[Socket] Usuário conectado à sala privativa: ${uIdStr}`);
+
+            // Atualiza status online no MongoDB e notifica ouvintes
+            try {
+                await User.findByIdAndUpdate(uIdStr, { isOnline: true, lastSeen: new Date() });
+                io.emit('presence_update', { userId: uIdStr, isOnline: true, lastSeen: new Date() });
+            } catch (e) {
+                console.error('[Socket] Erro ao atualizar status online:', e);
+            }
         }
     });
 
-    socket.on('join_admin_support', (userId) => {
+    // Conexão do Admin
+    socket.on('join_admin_support', async (userId) => {
         if (userId) {
+            if (mongoose.Types.ObjectId.isValid(userId)) {
+                const uIdStr = userId.toString();
+                connectedUsers.set(socket.id, uIdStr);
+                try {
+                    await User.findByIdAndUpdate(uIdStr, { isOnline: true, lastSeen: new Date() });
+                    io.emit('presence_update', { userId: uIdStr, isOnline: true, lastSeen: new Date() });
+                } catch (e) {
+                    console.error('[Socket] Erro ao atualizar status online do admin:', e);
+                }
+            }
             socket.join('admin_support_room');
             console.log(`[Socket] Admin conectado ao painel de suporte: ${userId}`);
         }
     });
 
+    // Indicador de "Digitando..." (Typing Indicator)
+    socket.on('typing_start', (data) => {
+        // data: { userId, targetUserId, isAdmin }
+        if (data && data.isAdmin && data.targetUserId) {
+            io.to(data.targetUserId.toString()).emit('user_typing', { userId: data.userId, isTyping: true });
+        } else if (data && data.userId) {
+            io.to('admin_support_room').emit('user_typing', { userId: data.userId, isTyping: true });
+        }
+    });
+
+    socket.on('typing_stop', (data) => {
+        if (data && data.isAdmin && data.targetUserId) {
+            io.to(data.targetUserId.toString()).emit('user_typing', { userId: data.userId, isTyping: false });
+        } else if (data && data.userId) {
+            io.to('admin_support_room').emit('user_typing', { userId: data.userId, isTyping: false });
+        }
+    });
+
+    // Confirmação de Leitura de Mensagens (Selos Azul / Read)
+    socket.on('mark_as_read', async (data) => {
+        // data: { userId (chat ID), readerId (quem leu) }
+        if (!data || !data.userId || !data.readerId) return;
+
+        try {
+            const now = new Date();
+            await SupportMessage.updateMany(
+                { userId: data.userId, senderId: { $ne: data.readerId }, status: { $ne: 'read' } },
+                { $set: { status: 'read', readAt: now } }
+            );
+
+            const payload = { userId: data.userId, readerId: data.readerId, status: 'read', readAt: now };
+            io.to(data.userId.toString()).emit('messages_read', payload);
+            io.to('admin_support_room').emit('messages_read', payload);
+        } catch (err) {
+            console.error('[Socket] Erro ao marcar como lido via Socket:', err);
+        }
+    });
+
+    // Confirmação de Entrega de Mensagens (Selos Cinza Duplo / Delivered)
+    socket.on('mark_as_delivered', async (data) => {
+        if (!data || !data.userId) return;
+
+        try {
+            await SupportMessage.updateMany(
+                { userId: data.userId, status: 'sent' },
+                { $set: { status: 'delivered' } }
+            );
+
+            const payload = { userId: data.userId, status: 'delivered' };
+            io.to(data.userId.toString()).emit('messages_delivered', payload);
+            io.to('admin_support_room').emit('messages_delivered', payload);
+        } catch (err) {
+            console.error('[Socket] Erro ao marcar como entregue via Socket:', err);
+        }
+    });
+
+    // Sincronização do Usuário
     socket.on('request_user_sync', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             try {
@@ -57,6 +140,27 @@ io.on('connection', (socket) => {
                 }
             } catch (err) {
                 console.error('[Socket] Erro ao sincronizar usuário:', err);
+            }
+        }
+    });
+
+    // Desconexão (Atualiza Visto por Último / Last Seen)
+    socket.on('disconnect', async () => {
+        const uId = connectedUsers.get(socket.id);
+        if (uId) {
+            connectedUsers.delete(socket.id);
+
+            // Verifica se o mesmo usuário possui outras guias/sockets abertos
+            const activeSockets = Array.from(connectedUsers.values()).filter(id => id === uId);
+            if (activeSockets.length === 0) {
+                const lastSeen = new Date();
+                try {
+                    await User.findByIdAndUpdate(uId, { isOnline: false, lastSeen });
+                    io.emit('presence_update', { userId: uId, isOnline: false, lastSeen });
+                    console.log(`[Socket] Usuário offline: ${uId}`);
+                } catch (e) {
+                    console.error('[Socket] Erro ao atualizar desconexão:', e);
+                }
             }
         }
     });
@@ -74,6 +178,8 @@ function notifyUserUpdate(userId, user) {
         studio: user.studio !== undefined ? user.studio : false,
         recoveryCode: user.recoveryCode || "",
         profile: user.profile || {},
+        isOnline: user.isOnline || false,
+        lastSeen: user.lastSeen || null,
         createdAt: user.createdAt || null
     };
 
@@ -106,6 +212,8 @@ const UserSchema = new mongoose.Schema({
     purchaseToken: { type: String, default: null },
     recoveryCode: { type: String, unique: true },
     profile: { type: mongoose.Schema.Types.Mixed, default: {} },
+    isOnline: { type: Boolean, default: false },
+    lastSeen: { type: Date, default: Date.now },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -116,6 +224,8 @@ const SupportMessageSchema = new mongoose.Schema({
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     senderModel: { type: String, enum: ['user', 'admin'], required: true },
     message: { type: String, required: true },
+    status: { type: String, enum: ['sent', 'delivered', 'read'], default: 'sent' },
+    readAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -145,7 +255,8 @@ mongoose.connect(process.env.MONGO_URL)
                 userId: testUserId,
                 senderId: testUserId,
                 senderModel: "user",
-                message: "Olá! Esta é uma mensagem de teste automática para o chat funcionar!"
+                message: "Olá! Esta é uma mensagem de teste automática para o chat funcionar!",
+                status: "sent"
             });
             console.log('>>> MENSAGEM E USUÁRIO DE TESTE CRIADOS COM SUCESSO NO BANCO! <<<');
         }
@@ -245,7 +356,6 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
 
 // ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
-    // Toda nova conta nasce por padrão com studio = false
     const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
 
@@ -262,7 +372,7 @@ app.post('/register', async (req, res) => {
             name, 
             avatar, 
             plan, 
-            studio: false, // Forçado obrigatoriamente como false no cadastro
+            studio: false, 
             recoveryCode, 
             profile 
         });
@@ -278,7 +388,9 @@ app.post('/register', async (req, res) => {
                 plan: user.plan,
                 studio: user.studio,
                 recoveryCode: user.recoveryCode,
-                profile: user.profile
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
             }
         });
     } catch (err) {
@@ -287,7 +399,6 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Rota de login enviando o parâmetro 'studio' para checagem rigorosa
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -309,7 +420,9 @@ app.post('/login', async (req, res) => {
                 plan: user.plan || 'FREE',
                 studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
-                profile: user.profile
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
             }
         });
     } catch (err) {
@@ -332,7 +445,9 @@ app.get('/me', auth, async (req, res) => {
                 plan: user.plan || 'FREE',
                 studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
-                profile: user.profile
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
             }
         });
     } catch (err) {
@@ -362,12 +477,32 @@ app.put('/profile', auth, async (req, res) => {
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
                 recoveryCode: user.recoveryCode,
-                profile: user.profile
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
             }
         });
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+// Rota extra para consultar presença de qualquer usuário em tempo real
+app.get('/user/presence/:userId', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.userId).select('isOnline lastSeen name avatar');
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            presence: {
+                isOnline: user.isOnline || false,
+                lastSeen: user.lastSeen || null
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ error: 'Erro ao buscar presença' });
     }
 });
 
@@ -517,7 +652,7 @@ app.put('/admin/change-plan', async (req, res) => {
     }
 });
 
-// ================= ROTAS DE SUPORTE (CHAT) =================
+// ================= ROTAS DE SUPORTE (CHAT NATIVO COM SELOS E DATAS) =================
 app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
     try {
         const requestingUser = await User.findById(req.userId);
@@ -530,7 +665,7 @@ app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
 
         const messages = await SupportMessage.find({ userId: queryUserId })
             .sort({ createdAt: 1 })
-            .populate('senderId', 'name avatar email');
+            .populate('senderId', 'name avatar email isOnline lastSeen');
 
         return res.json({ success: true, messages });
     } catch (err) {
@@ -552,7 +687,21 @@ app.get('/support/admin/chats', auth, async (req, res) => {
                 $group: {
                     _id: "$userId",
                     lastMessage: { $first: "$message" },
-                    lastMessageDate: { $first: "$createdAt" }
+                    lastMessageDate: { $first: "$createdAt" },
+                    lastMessageStatus: { $first: "$status" },
+                    lastMessageSenderModel: { $first: "$senderModel" },
+                    unreadCount: {
+                        $sum: {
+                            $cond: [
+                                { $and: [
+                                    { $eq: ["$senderModel", "user"] },
+                                    { $ne: ["$status", "read"] }
+                                ]},
+                                1,
+                                0
+                            ]
+                        }
+                    }
                 }
             },
             { $sort: { lastMessageDate: -1 } }
@@ -560,7 +709,7 @@ app.get('/support/admin/chats', auth, async (req, res) => {
 
         const populatedChats = await User.populate(chats, {
             path: '_id',
-            select: 'name email avatar plan studio'
+            select: 'name email avatar plan studio isOnline lastSeen'
         });
 
         return res.json({ success: true, chats: populatedChats });
@@ -590,11 +739,13 @@ app.post('/support/message', auth, async (req, res) => {
             userId: chatUserId,
             senderId: sender._id,
             senderModel: senderModel,
-            message: message.trim()
+            message: message.trim(),
+            status: 'sent',
+            readAt: null
         });
 
         const populatedMessage = await SupportMessage.findById(newMessage._id)
-            .populate('senderId', 'name avatar email');
+            .populate('senderId', 'name avatar email isOnline lastSeen');
 
         io.to(chatUserId.toString()).emit('new_support_message', populatedMessage);
         io.to('admin_support_room').emit('new_support_message', populatedMessage);
@@ -603,6 +754,35 @@ app.post('/support/message', auth, async (req, res) => {
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro ao enviar mensagem' });
+    }
+});
+
+// Rota HTTP para confirmação de leitura via API
+app.post('/support/read', auth, async (req, res) => {
+    const { targetUserId } = req.body;
+    try {
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let chatUserId = req.userId;
+        if (requestingUser.studio && targetUserId) {
+            chatUserId = targetUserId;
+        }
+
+        const now = new Date();
+        await SupportMessage.updateMany(
+            { userId: chatUserId, senderId: { $ne: req.userId }, status: { $ne: 'read' } },
+            { $set: { status: 'read', readAt: now } }
+        );
+
+        const payload = { userId: chatUserId, readerId: req.userId, status: 'read', readAt: now };
+        io.to(chatUserId.toString()).emit('messages_read', payload);
+        io.to('admin_support_room').emit('messages_read', payload);
+
+        return res.json({ success: true, readAt: now });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao marcar mensagens como lidas' });
     }
 });
 

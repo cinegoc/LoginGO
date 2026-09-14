@@ -39,8 +39,7 @@ const userActiveSockets = new Map();
 async function setOfflineUser(userId, ioInstance) {
     if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
     const uIdStr = userId.toString();
-    
-    // Remove do mapa de sockets ativos se ainda estiver lá
+
     if (userActiveSockets.has(uIdStr)) {
         userActiveSockets.delete(uIdStr);
     }
@@ -48,11 +47,8 @@ async function setOfflineUser(userId, ioInstance) {
     const lastSeen = new Date();
     try {
         await User.findByIdAndUpdate(uIdStr, { isOnline: false, lastSeen });
-        
-        // Formata a hora para exibição amigável (ex: "às 15:20" ou hora local)
         const formattedLastSeen = lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-        // Notifica o painel admin e a sala privativa do usuário simultaneamente
         ioInstance.to('admin_support_room').emit('user_status_changed', { 
             userId: uIdStr, 
             isOnline: false, 
@@ -63,8 +59,6 @@ async function setOfflineUser(userId, ioInstance) {
             isOnline: false, 
             lastSeen: formattedLastSeen 
         });
-
-        console.log(`[Socket] Usuário desconectado e marcado offline com sucesso: ${uIdStr}`);
     } catch (e) {
         console.error('[Socket] Erro crítico ao persistir status offline:', e);
     }
@@ -73,7 +67,6 @@ async function setOfflineUser(userId, ioInstance) {
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
-    // Conexão do Usuário Comum
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
@@ -83,8 +76,6 @@ io.on('connection', (socket) => {
                 userActiveSockets.set(uIdStr, new Set());
             }
             userActiveSockets.get(uIdStr).add(socket.id);
-
-            console.log(`[Socket] Usuário conectado à sala privativa: ${uIdStr} (Socket ID: ${socket.id})`);
 
             try {
                 await User.findByIdAndUpdate(uIdStr, { isOnline: true });
@@ -96,12 +87,11 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Conexão do Admin / Suporte
     socket.on('join_admin_support', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
             socket.join('admin_support_room');
-            socket.join(uIdStr); // Permite também escutar a própria sala
+            socket.join(uIdStr);
 
             if (!userActiveSockets.has(uIdStr)) {
                 userActiveSockets.set(uIdStr, new Set());
@@ -114,11 +104,9 @@ io.on('connection', (socket) => {
             } catch (e) {
                 console.error('[Socket] Erro ao atualizar status online do admin:', e);
             }
-            console.log(`[Socket] Admin conectado ao painel de suporte: ${uIdStr}`);
         }
     });
 
-    // Indicador de "Digitando..." unificado (Cliente -> Admin)
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
             io.to('admin_support_room').emit('typing_status', { 
@@ -128,7 +116,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Indicador de "Digitando..." unificado (Admin -> Cliente)
     socket.on('support_typing', (data) => {
         if (data && data.userId) {
             io.to(data.userId.toString()).emit('support_typing', { 
@@ -139,28 +126,24 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Status Online do Atendente para o Cliente
     socket.on('support_status', (data) => {
         if (data) {
             io.emit('support_status', data);
         }
     });
 
-    // Confirmação de Leitura de Mensagens (Selos Azuis / Read) em tempo real
     socket.on('mark_as_read', async (targetUserId) => {
         const uId = typeof targetUserId === 'string' ? targetUserId : (targetUserId && targetUserId.userId ? targetUserId.userId : null);
         if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
 
         try {
             const now = new Date();
-            // Atualiza todas as mensagens pendentes deste usuário para 'read'
             await SupportMessage.updateMany(
                 { userId: uId, status: { $ne: 'read' } },
                 { $set: { status: 'read', readAt: now } }
             );
 
             const payload = { userId: uId, status: 'read', readAt: now };
-            // Emite para o app do cliente e para o painel do admin imediatamente (tempo real absoluto)
             io.to(uId.toString()).emit('messages_read', payload);
             io.to('admin_support_room').emit('messages_read', payload);
         } catch (err) {
@@ -168,7 +151,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Confirmação de Entrega de Mensagens (Selos Cinzas / Delivered)
     socket.on('mark_as_delivered', async (data) => {
         const uId = typeof data === 'string' ? data : (data && data.userId ? data.userId : null);
         if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
@@ -187,20 +169,16 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Desconexão manual explícita vinda do App (Garante saída imediata ao fechar app ou trocar de aba)
     socket.on('force_disconnect', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             await setOfflineUser(userId, io);
         }
     });
 
-    // Desconexão nativa do socket (Queda de conexão, fechamento abrupto, etc.)
     socket.on('disconnect', async () => {
         for (let [userId, socketSet] of userActiveSockets.entries()) {
             if (socketSet.has(socket.id)) {
                 socketSet.delete(socket.id);
-                
-                // Se o usuário não possui mais nenhuma aba/conexão ativa, marca offline imediatamente
                 if (socketSet.size === 0) {
                     await setOfflineUser(userId, io);
                 }
@@ -209,24 +187,6 @@ io.on('connection', (socket) => {
         }
     });
 });
-
-function notifyUserUpdate(userId, user) {
-    if (!userId || !user) return;
-    const userDataPayload = {
-        id: user._id ? user._id.toString() : user.id,
-        name: user.name || "",
-        email: user.email || "",
-        avatar: user.avatar || "",
-        plan: user.plan || 'FREE',
-        studio: user.studio !== undefined ? user.studio : false,
-        recoveryCode: user.recoveryCode || "",
-        profile: user.profile || {},
-        isOnline: user.isOnline || false,
-        lastSeen: user.lastSeen || null,
-        createdAt: user.createdAt || null
-    };
-    io.to(userId.toString()).emit('user_updated', userDataPayload);
-}
 
 const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
 
@@ -272,39 +232,8 @@ const SupportMessageSchema = new mongoose.Schema({
 
 const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
 
-// Conexão com MongoDB
 mongoose.connect(process.env.MONGO_URL)
-.then(async () => {
-    console.log('MongoDB conectado com sucesso');
-    try {
-        const totalMensagens = await SupportMessage.countDocuments();
-        if (totalMensagens === 0) {
-            const testUserId = new mongoose.Types.ObjectId("650f1a2b3c4d5e6f7a8b9c01");
-            let userExistente = await User.findById(testUserId);
-            if (!userExistente) {
-                await User.create({
-                    _id: testUserId,
-                    email: "cliente.teste@email.com",
-                    password: "$2a$10$fictitioushashforclienttest",
-                    name: "João Teste (Cliente)",
-                    plan: "PRO",
-                    studio: true,
-                    recoveryCode: "SG-1111-2222"
-                });
-            }
-            await SupportMessage.create({
-                userId: testUserId,
-                senderId: testUserId,
-                senderModel: "user",
-                message: "Olá! Esta é uma mensagem de teste automática para o chat funcionar!",
-                status: "sent"
-            });
-            console.log('>>> MENSAGEM E USUÁRIO DE TESTE CRIADOS COM SUCESSO NO BANCO! <<<');
-        }
-    } catch (e) {
-        console.error('Erro ao criar dados de teste:', e);
-    }
-})
+.then(() => console.log('MongoDB conectado com sucesso'))
 .catch(err => console.error('Erro ao conectar no MongoDB:', err));
 
 function generateRecoveryCode() {
@@ -351,7 +280,6 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ================= UPLOAD AVATAR =================
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
@@ -395,7 +323,6 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     }
 });
 
-// ================= ROTAS DE AUTENTICAÇÃO E PERFIL =================
 app.post('/register', async (req, res) => {
     const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
@@ -529,7 +456,6 @@ app.put('/profile', auth, async (req, res) => {
     }
 });
 
-// Rota extra para consultar presença de qualquer usuário em tempo real
 app.get('/user/presence/:userId', auth, async (req, res) => {
     try {
         const user = await User.findById(req.params.userId).select('isOnline lastSeen name avatar');
@@ -547,7 +473,6 @@ app.get('/user/presence/:userId', auth, async (req, res) => {
     }
 });
 
-// ================= VERIFY PURCHASES (GOOGLE PLAY) =================
 app.post('/verify-purchase', auth, async (req, res) => {
     const { purchaseToken } = req.body;
     if (!purchaseToken) return res.status(400).json({ error: 'Token de compra não enviado' });
@@ -570,7 +495,6 @@ app.post('/verify-purchase', auth, async (req, res) => {
     }
 });
 
-// ================= SENHAS E SEGURANÇA =================
 app.post('/verify-password', auth, async (req, res) => {
     const { currentPassword } = req.body;
     if (!currentPassword) return res.status(400).json({ error: 'Senha não informada' });
@@ -668,7 +592,6 @@ app.post('/recover-with-code', async (req, res) => {
     }
 });
 
-// ================= ADMIN: ALTERAR PLANO =================
 app.put('/admin/change-plan', async (req, res) => {
     const { email, plan } = req.body;
     if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
@@ -693,7 +616,7 @@ app.put('/admin/change-plan', async (req, res) => {
     }
 });
 
-// ================= ROTAS DE SUPORTE (CHAT NATIVO COM SELOS E DATAS) =================
+// ================= ROTAS DE SUPORTE =================
 app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
     try {
         const requestingUser = await User.findById(req.userId);
@@ -788,6 +711,7 @@ app.post('/support/message', auth, async (req, res) => {
         const populatedMessage = await SupportMessage.findById(newMessage._id)
             .populate('senderId', 'name avatar email isOnline lastSeen');
 
+        // Emissão limpa e centralizada para evitar duplicidades de escuta no cliente
         io.to(chatUserId.toString()).emit('new_support_message', populatedMessage);
         io.to('admin_support_room').emit('new_support_message', populatedMessage);
 
@@ -798,7 +722,6 @@ app.post('/support/message', auth, async (req, res) => {
     }
 });
 
-// Rota HTTP para confirmação de leitura via API
 app.post('/support/read', auth, async (req, res) => {
     const { targetUserId } = req.body;
     try {

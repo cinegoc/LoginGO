@@ -69,9 +69,11 @@ async function setOfflineUser(userId, ioInstance) {
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
+    // 1. Cliente entra na própria sala isolada
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
+            socket.join(`user_${uIdStr}`);
             socket.join(uIdStr);
 
             if (!userActiveSockets.has(uIdStr)) {
@@ -82,7 +84,7 @@ io.on('connection', (socket) => {
             try {
                 await User.findByIdAndUpdate(uIdStr, { isOnline: true });
                 io.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
-                io.to(uIdStr).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                io.to(`user_${uIdStr}`).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
                 io.emit('support_status', { userId: uIdStr, isOnline: true, lastSeen: "" });
             } catch (e) {
                 console.error('[Socket] Erro ao atualizar status online do usuário:', e);
@@ -90,10 +92,14 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('join_admin_support', async (userId) => {
-        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-            const uIdStr = userId.toString();
-            socket.join('admin_support_room');
+    // 2. Administrador entra na sala global/administrativa
+    socket.on('join_admin_support', async (adminId) => {
+        const targetId = adminId || (socket.handshake.auth && socket.handshake.auth.userId);
+        socket.join('admin_support_room');
+
+        if (targetId && mongoose.Types.ObjectId.isValid(targetId)) {
+            const uIdStr = targetId.toString();
+            socket.join(`user_${uIdStr}`);
             socket.join(uIdStr);
 
             if (!userActiveSockets.has(uIdStr)) {
@@ -110,12 +116,59 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Tratamento cirúrgico adicionado para atender a solicitação do app por status de suporte
+    // 3. Atualização de status online do suporte
+    socket.on('support_status', (data) => {
+        if (data) {
+            io.emit('support_status', data);
+        }
+    });
+
+    // 4. Indicador de digitação do Usuário para o Admin
+    socket.on('user_typing', (data) => {
+        if (data && data.userId) {
+            const payload = { 
+                userId: data.userId.toString(), 
+                isTyping: Boolean(data.isTyping) 
+            };
+            io.to('admin_support_room').emit('user_typing', payload);
+            io.to('admin_support_room').emit('typing_status', payload);
+        }
+    });
+
+    // 5. Indicador de digitação do Admin para o Usuário específico
+    socket.on('support_typing', (data) => {
+        if (data && data.userId) {
+            io.to(`user_${data.userId}`).emit('support_typing', { 
+                userId: data.userId.toString(), 
+                isTyping: Boolean(data.isTyping),
+                name: data.name || "Suporte Cine GO!"
+            });
+        }
+    });
+
+    // 6. Marcar mensagens como lidas
+    socket.on('mark_as_read', async (userId) => {
+        const uId = typeof userId === 'string' ? userId : (userId && userId.userId ? userId.userId : null);
+        if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
+
+        try {
+            const now = new Date();
+            await SupportMessage.updateMany(
+                { userId: uId, status: { $ne: 'read' } },
+                { $set: { status: 'read', readAt: now } }
+            );
+
+            io.to(`user_${uId}`).emit('messages_read', { userId: uId, status: 'read', readAt: now });
+            io.to('admin_support_room').emit('messages_read', { userId: uId, status: 'read', readAt: now });
+        } catch (err) {
+            console.error('[Socket] Erro ao marcar como lido via Socket:', err);
+        }
+    });
+
     socket.on('get_support_status', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             try {
                 const targetUser = await User.findById(userId);
-                
                 let isAgentOnline = false;
                 for (let [uId, socketSet] of userActiveSockets.entries()) {
                     const u = await User.findById(uId);
@@ -131,81 +184,8 @@ io.on('connection', (socket) => {
                     lastSeen: targetUser && targetUser.lastSeen ? targetUser.lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""
                 });
             } catch (e) {
-                console.error('[Socket] Erro ao buscar status do suporte via get_support_status:', e);
+                console.error('[Socket] Erro ao buscar status do suporte:', e);
             }
-        }
-    });
-
-    socket.on('user_typing', (data) => {
-        if (data && data.userId) {
-            const payload = { 
-                userId: data.userId.toString(), 
-                isTyping: Boolean(data.isTyping) 
-            };
-            io.to('admin_support_room').emit('user_typing', payload);
-            io.to('admin_support_room').emit('typing_status', payload);
-        }
-    });
-
-    socket.on('support_typing', (data) => {
-        if (data && data.userId) {
-            io.to(data.userId.toString()).emit('support_typing', { 
-                userId: data.userId.toString(), 
-                isTyping: Boolean(data.isTyping),
-                name: data.name || "Suporte Cine GO!"
-            });
-        }
-    });
-
-    socket.on('support_status', (data) => {
-        if (data) {
-            io.emit('support_status', data);
-        }
-    });
-
-    socket.on('mark_as_read', async (data) => {
-        const uId = typeof data === 'string' ? data : (data && data.userId ? data.userId : null);
-        const readerId = data && data.readerId ? data.readerId : null;
-        if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
-
-        try {
-            const now = new Date();
-            const query = { userId: uId, status: { $ne: 'read' } };
-            if (readerId && mongoose.Types.ObjectId.isValid(readerId)) {
-                query.senderId = { $ne: readerId };
-            }
-
-            await SupportMessage.updateMany(query, { $set: { status: 'read', readAt: now } });
-
-            const payload = { userId: uId, readerId, status: 'read', readAt: now };
-            io.to(uId.toString()).emit('messages_read', payload);
-            io.to('admin_support_room').emit('messages_read', payload);
-        } catch (err) {
-            console.error('[Socket] Erro ao marcar como lido via Socket:', err);
-        }
-    });
-
-    socket.on('mark_as_delivered', async (data) => {
-        const uId = typeof data === 'string' ? data : (data && data.userId ? data.userId : null);
-        if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
-
-        try {
-            await SupportMessage.updateMany(
-                { userId: uId, status: 'sent' },
-                { $set: { status: 'delivered' } }
-            );
-
-            const payload = { userId: uId, status: 'delivered' };
-            io.to(uId.toString()).emit('messages_delivered', payload);
-            io.to('admin_support_room').emit('messages_delivered', payload);
-        } catch (err) {
-            console.error('[Socket] Erro ao marcar como entregue via Socket:', err);
-        }
-    });
-
-    socket.on('force_disconnect', async (userId) => {
-        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-            await setOfflineUser(userId, io);
         }
     });
 
@@ -716,41 +696,45 @@ app.get('/support/admin/chats', auth, async (req, res) => {
     }
 });
 
+// ================= Rota POST /support/message integrada exatamente como especificado =================
 app.post('/support/message', auth, async (req, res) => {
-    const { message, targetUserId } = req.body;
-    if (!message || !message.trim()) return res.status(400).json({ error: 'A mensagem não pode estar vazia' });
-
     try {
-        const sender = await User.findById(req.userId);
+        const { message, targetUserId } = req.body;
+        const senderId = req.userId;
+        
+        const sender = await User.findById(senderId);
         if (!sender) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-        let chatUserId = sender._id;
-        let senderModel = 'user';
+        const isAdmin = sender.studio === true; 
 
-        if (sender.studio && targetUserId) {
-            chatUserId = targetUserId;
-            senderModel = 'admin';
-        }
-
+        // Salva no MongoDB/Banco de Dados...
         const newMessage = await SupportMessage.create({
-            userId: chatUserId,
-            senderId: sender._id,
-            senderModel: senderModel,
-            message: message.trim(),
+            userId: isAdmin ? targetUserId : senderId,
+            senderId,
+            senderModel: isAdmin ? 'admin' : 'user',
+            message,
+            targetUserId: isAdmin ? targetUserId : senderId,
             status: 'sent',
-            readAt: null
+            createdAt: new Date()
         });
 
+        // Popula os dados do remetente para a interface
         const populatedMessage = await SupportMessage.findById(newMessage._id)
             .populate('senderId', 'name avatar email isOnline lastSeen');
 
-        io.to(chatUserId.toString()).emit('new_support_message', populatedMessage);
-        io.to('admin_support_room').emit('new_support_message', populatedMessage);
+        // Emite via Socket.IO em tempo real para a sala correta
+        if (isAdmin) {
+            io.to(`user_${targetUserId}`).emit('new_support_message', populatedMessage);
+            io.to('admin_support_room').emit('new_support_message', populatedMessage);
+        } else {
+            io.to(`user_${senderId}`).emit('new_support_message', populatedMessage);
+            io.to('admin_support_room').emit('new_support_message', populatedMessage);
+        }
 
-        return res.json({ success: true, message: populatedMessage });
-    } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro ao enviar mensagem' });
+        return res.status(200).json({ success: true, message: populatedMessage });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ error: error.message });
     }
 });
 
@@ -771,9 +755,8 @@ app.post('/support/read', auth, async (req, res) => {
             { $set: { status: 'read', readAt: now } }
         );
 
-        const payload = { userId: chatUserId, readerId: req.userId, status: 'read', readAt: now };
-        io.to(chatUserId.toString()).emit('messages_read', payload);
-        io.to('admin_support_room').emit('messages_read', payload);
+        io.to(`user_${chatUserId}`).emit('messages_read', { userId: chatUserId, status: 'read', readAt: now });
+        io.to('admin_support_room').emit('messages_read', { userId: chatUserId, status: 'read', readAt: now });
 
         return res.json({ success: true, readAt: now });
     } catch (err) {

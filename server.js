@@ -32,43 +32,89 @@ app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
-// Map para controle de conexões ativas do Socket (socket.id -> userId)
-const connectedUsers = new Map();
+// Mapa rigoroso para controle de sockets ativos: Map<userId, Set<socketId>>
+const userActiveSockets = new Map();
+
+// Função auxiliar centralizada para forçar o status offline de forma atômica
+async function setOfflineUser(userId, ioInstance) {
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
+    const uIdStr = userId.toString();
+    
+    // Remove do mapa de sockets ativos se ainda estiver lá
+    if (userActiveSockets.has(uIdStr)) {
+        userActiveSockets.delete(uIdStr);
+    }
+
+    const lastSeen = new Date();
+    try {
+        await User.findByIdAndUpdate(uIdStr, { isOnline: false, lastSeen });
+        
+        // Formata a hora para exibição amigável (ex: "às 15:20" ou hora local)
+        const formattedLastSeen = lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        // Notifica o painel admin e a sala privativa do usuário simultaneamente
+        ioInstance.to('admin_support_room').emit('user_status_changed', { 
+            userId: uIdStr, 
+            isOnline: false, 
+            lastSeen: formattedLastSeen 
+        });
+        ioInstance.to(uIdStr).emit('user_status_changed', { 
+            userId: uIdStr, 
+            isOnline: false, 
+            lastSeen: formattedLastSeen 
+        });
+
+        console.log(`[Socket] Usuário desconectado e marcado offline com sucesso: ${uIdStr}`);
+    } catch (e) {
+        console.error('[Socket] Erro crítico ao persistir status offline:', e);
+    }
+}
 
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
-    // Conexão do Usuário
+    // Conexão do Usuário Comum
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
             socket.join(uIdStr);
-            connectedUsers.set(socket.id, uIdStr);
-            console.log(`[Socket] Usuário conectado à sala privativa: ${uIdStr}`);
+
+            if (!userActiveSockets.has(uIdStr)) {
+                userActiveSockets.set(uIdStr, new Set());
+            }
+            userActiveSockets.get(uIdStr).add(socket.id);
+
+            console.log(`[Socket] Usuário conectado à sala privativa: ${uIdStr} (Socket ID: ${socket.id})`);
 
             try {
-                await User.findByIdAndUpdate(uIdStr, { isOnline: true, lastSeen: new Date() });
+                await User.findByIdAndUpdate(uIdStr, { isOnline: true });
                 io.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                io.to(uIdStr).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
             } catch (e) {
-                console.error('[Socket] Erro ao atualizar status online:', e);
+                console.error('[Socket] Erro ao atualizar status online do usuário:', e);
             }
         }
     });
 
-    // Conexão do Admin
+    // Conexão do Admin / Suporte
     socket.on('join_admin_support', async (userId) => {
-        if (userId) {
-            if (mongoose.Types.ObjectId.isValid(userId)) {
-                const uIdStr = userId.toString();
-                connectedUsers.set(socket.id, uIdStr);
-                try {
-                    await User.findByIdAndUpdate(uIdStr, { isOnline: true, lastSeen: new Date() });
-                } catch (e) {
-                    console.error('[Socket] Erro ao atualizar status online do admin:', e);
-                }
-            }
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+            const uIdStr = userId.toString();
             socket.join('admin_support_room');
-            console.log(`[Socket] Admin conectado ao painel de suporte: ${userId}`);
+            socket.join(uIdStr); // Permite também escutar a própria sala
+
+            if (!userActiveSockets.has(uIdStr)) {
+                userActiveSockets.set(uIdStr, new Set());
+            }
+            userActiveSockets.get(uIdStr).add(socket.id);
+
+            try {
+                await User.findByIdAndUpdate(uIdStr, { isOnline: true });
+                io.emit('support_status', { userId: uIdStr, isOnline: true });
+            } catch (e) {
+                console.error('[Socket] Erro ao atualizar status online do admin:', e);
+            }
+            console.log(`[Socket] Admin conectado ao painel de suporte: ${uIdStr}`);
         }
     });
 
@@ -76,8 +122,8 @@ io.on('connection', (socket) => {
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
             io.to('admin_support_room').emit('typing_status', { 
-                userId: data.userId, 
-                isTyping: data.isTyping 
+                userId: data.userId.toString(), 
+                isTyping: Boolean(data.isTyping) 
             });
         }
     });
@@ -86,8 +132,8 @@ io.on('connection', (socket) => {
     socket.on('support_typing', (data) => {
         if (data && data.userId) {
             io.to(data.userId.toString()).emit('support_typing', { 
-                userId: data.userId, 
-                isTyping: data.isTyping,
+                userId: data.userId.toString(), 
+                isTyping: Boolean(data.isTyping),
                 name: data.name || "Suporte Cine GO!"
             });
         }
@@ -100,19 +146,21 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Confirmação de Leitura de Mensagens (Selos Azul / Read)
+    // Confirmação de Leitura de Mensagens (Selos Azuis / Read) em tempo real
     socket.on('mark_as_read', async (targetUserId) => {
         const uId = typeof targetUserId === 'string' ? targetUserId : (targetUserId && targetUserId.userId ? targetUserId.userId : null);
-        if (!uId) return;
+        if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
 
         try {
             const now = new Date();
+            // Atualiza todas as mensagens pendentes deste usuário para 'read'
             await SupportMessage.updateMany(
                 { userId: uId, status: { $ne: 'read' } },
                 { $set: { status: 'read', readAt: now } }
             );
 
             const payload = { userId: uId, status: 'read', readAt: now };
+            // Emite para o app do cliente e para o painel do admin imediatamente (tempo real absoluto)
             io.to(uId.toString()).emit('messages_read', payload);
             io.to('admin_support_room').emit('messages_read', payload);
         } catch (err) {
@@ -120,10 +168,10 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Confirmação de Entrega de Mensagens
+    // Confirmação de Entrega de Mensagens (Selos Cinzas / Delivered)
     socket.on('mark_as_delivered', async (data) => {
         const uId = typeof data === 'string' ? data : (data && data.userId ? data.userId : null);
-        if (!uId) return;
+        if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
 
         try {
             await SupportMessage.updateMany(
@@ -139,26 +187,24 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Desconexão (Atualiza Visto por Último / Last Seen)
-    socket.on('disconnect', async () => {
-        const uId = connectedUsers.get(socket.id);
-        if (uId) {
-            connectedUsers.delete(socket.id);
+    // Desconexão manual explícita vinda do App (Garante saída imediata ao fechar app ou trocar de aba)
+    socket.on('force_disconnect', async (userId) => {
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+            await setOfflineUser(userId, io);
+        }
+    });
 
-            const activeSockets = Array.from(connectedUsers.values()).filter(id => id === uId);
-            if (activeSockets.length === 0) {
-                const lastSeen = new Date();
-                try {
-                    await User.findByIdAndUpdate(uId, { isOnline: false, lastSeen });
-                    io.to('admin_support_room').emit('user_status_changed', { 
-                        userId: uId, 
-                        isOnline: false, 
-                        lastSeen: lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
-                    });
-                    console.log(`[Socket] Usuário offline: ${uId}`);
-                } catch (e) {
-                    console.error('[Socket] Erro ao atualizar desconexão:', e);
+    // Desconexão nativa do socket (Queda de conexão, fechamento abrupto, etc.)
+    socket.on('disconnect', async () => {
+        for (let [userId, socketSet] of userActiveSockets.entries()) {
+            if (socketSet.has(socket.id)) {
+                socketSet.delete(socket.id);
+                
+                // Se o usuário não possui mais nenhuma aba/conexão ativa, marca offline imediatamente
+                if (socketSet.size === 0) {
+                    await setOfflineUser(userId, io);
                 }
+                break;
             }
         }
     });

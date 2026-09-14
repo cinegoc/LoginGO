@@ -104,7 +104,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Sincronizado para disparar tanto 'user_typing' quanto 'typing_status' para o Admin
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
             const payload = { 
@@ -116,7 +115,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Sincronizado para disparar 'support_typing' para o Usuário específico
     socket.on('support_typing', (data) => {
         if (data && data.userId) {
             io.to(data.userId.toString()).emit('support_typing', { 
@@ -133,19 +131,21 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('mark_as_read', async (targetUserId) => {
-        const uId = typeof targetUserId === 'string' ? targetUserId : (targetUserId && targetUserId.userId ? targetUserId.userId : null);
+    socket.on('mark_as_read', async (data) => {
+        const uId = typeof data === 'string' ? data : (data && data.userId ? data.userId : null);
+        const readerId = data && data.readerId ? data.readerId : null;
         if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
 
         try {
             const now = new Date();
-            // Marca como lida apenas as mensagens do chat que NÃO são do próprio leitor
-            await SupportMessage.updateMany(
-                { userId: uId, status: { $ne: 'read' } },
-                { $set: { status: 'read', readAt: now } }
-            );
+            const query = { userId: uId, status: { $ne: 'read' } };
+            if (readerId && mongoose.Types.ObjectId.isValid(readerId)) {
+                query.senderId = { $ne: readerId };
+            }
 
-            const payload = { userId: uId, status: 'read', readAt: now };
+            await SupportMessage.updateMany(query, { $set: { status: 'read', readAt: now } });
+
+            const payload = { userId: uId, readerId, status: 'read', readAt: now };
             io.to(uId.toString()).emit('messages_read', payload);
             io.to('admin_support_room').emit('messages_read', payload);
         } catch (err) {

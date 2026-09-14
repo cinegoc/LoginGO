@@ -110,6 +110,32 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Tratamento cirúrgico adicionado para atender a solicitação do app por status de suporte
+    socket.on('get_support_status', async (userId) => {
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+            try {
+                const targetUser = await User.findById(userId);
+                
+                let isAgentOnline = false;
+                for (let [uId, socketSet] of userActiveSockets.entries()) {
+                    const u = await User.findById(uId);
+                    if (u && u.studio && socketSet.size > 0) {
+                        isAgentOnline = true;
+                        break;
+                    }
+                }
+
+                socket.emit('support_status', {
+                    userId: userId.toString(),
+                    isOnline: isAgentOnline,
+                    lastSeen: targetUser && targetUser.lastSeen ? targetUser.lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ""
+                });
+            } catch (e) {
+                console.error('[Socket] Erro ao buscar status do suporte via get_support_status:', e);
+            }
+        }
+    });
+
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
             const payload = { 

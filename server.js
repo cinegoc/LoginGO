@@ -56,6 +56,11 @@ async function setOfflineUser(userId, ioInstance) {
             isOnline: false, 
             lastSeen: formattedLastSeen 
         });
+        ioInstance.emit('support_status', { 
+            userId: uIdStr, 
+            isOnline: false, 
+            lastSeen: formattedLastSeen 
+        });
     } catch (e) {
         console.error('[Socket] Erro crítico ao persistir status offline:', e);
     }
@@ -78,6 +83,7 @@ io.on('connection', (socket) => {
                 await User.findByIdAndUpdate(uIdStr, { isOnline: true });
                 io.to('admin_support_room').emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
                 io.to(uIdStr).emit('user_status_changed', { userId: uIdStr, isOnline: true, lastSeen: "" });
+                io.emit('support_status', { userId: uIdStr, isOnline: true, lastSeen: "" });
             } catch (e) {
                 console.error('[Socket] Erro ao atualizar status online do usuário:', e);
             }

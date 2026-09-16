@@ -220,9 +220,17 @@ io.on('connection', (socket) => {
         }
     });
     
-    socket.on('send_report', (data) => {
+    socket.on('send_report', async (data) => {
         const { itemId, title, reason, userId } = data || {};
         console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
+        
+        try {
+            if (itemId || reason) {
+                await Report.create({ itemId, title, reason, userId });
+            }
+        } catch (err) {
+            console.error('[Socket] Erro ao salvar reporte no banco:', err);
+        }
     });
 
     socket.on('disconnect', async () => {
@@ -289,6 +297,16 @@ const SupportMessageSchema = new mongoose.Schema({
 });
 
 const SupportMessage = mongoose.model('SupportMessage', SupportMessageSchema);
+
+const ReportSchema = new mongoose.Schema({
+    itemId: String,
+    title: String,
+    reason: String,
+    userId: String,
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Report = mongoose.model('Report', ReportSchema);
 
 mongoose.connect(process.env.MONGO_URL)
 .then(() => console.log('MongoDB conectado com sucesso'))
@@ -810,7 +828,9 @@ app.post('/api/report', async (req, res) => {
         const { itemId, title, reason, userId } = req.body;
         console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
 
-        return res.status(200).json({ success: true, message: 'Reporte recebido com sucesso!' });
+        await Report.create({ itemId, title, reason, userId });
+
+        return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!' });
     } catch (err) {
         console.error('Erro ao processar reporte:', err);
         return res.status(500).json({ error: 'Erro interno ao salvar reporte' });

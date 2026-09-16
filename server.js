@@ -220,13 +220,15 @@ io.on('connection', (socket) => {
         }
     });
     
+    // 8. Receber reporte via Socket e notificar a sala admin
     socket.on('send_report', async (data) => {
         const { itemId, title, reason, userId } = data || {};
         console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
         
         try {
             if (itemId || reason) {
-                await Report.create({ itemId, title, reason, userId });
+                const newReport = await Report.create({ itemId, title, reason, userId });
+                io.to('admin_support_room').emit('new_report', newReport);
             }
         } catch (err) {
             console.error('[Socket] Erro ao salvar reporte no banco:', err);
@@ -823,17 +825,54 @@ app.post('/support/read', auth, async (req, res) => {
     }
 });
 
+// ================= ROTAS DE REPORTES =================
+
+// 1. Buscar todos os reportes (Usado pelo ReportsUX.Runtime no Android)
+app.get('/api/reports', async (req, res) => {
+    try {
+        const reports = await Report.find().sort({ createdAt: -1 });
+        return res.status(200).json({ success: true, reports });
+    } catch (err) {
+        console.error('Erro ao listar reportes:', err);
+        return res.status(500).json({ error: 'Erro interno ao listar reportes' });
+    }
+});
+
+// 2. Criar um novo reporte via HTTP
 app.post('/api/report', async (req, res) => {
     try {
         const { itemId, title, reason, userId } = req.body;
         console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
 
-        await Report.create({ itemId, title, reason, userId });
+        const newReport = await Report.create({ itemId, title, reason, userId });
 
-        return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!' });
+        // Notifica admins conectados via WebSocket em tempo real
+        io.to('admin_support_room').emit('new_report', newReport);
+
+        return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!', report: newReport });
     } catch (err) {
         console.error('Erro ao processar reporte:', err);
         return res.status(500).json({ error: 'Erro interno ao salvar reporte' });
+    }
+});
+
+// 3. Deletar/Resolver reporte por ID
+app.delete('/api/reports/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'ID de reporte inválido' });
+        }
+
+        const deleted = await Report.findByIdAndDelete(id);
+        if (!deleted) {
+            return res.status(404).json({ error: 'Reporte não encontrado' });
+        }
+
+        return res.status(200).json({ success: true, message: 'Reporte deletado com sucesso!' });
+    } catch (err) {
+        console.error('Erro ao deletar reporte:', err);
+        return res.status(500).json({ error: 'Erro interno ao deletar reporte' });
     }
 });
 

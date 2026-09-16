@@ -219,6 +219,11 @@ io.on('connection', (socket) => {
             console.error('[Socket] Erro ao buscar status do suporte:', e);
         }
     });
+    
+    socket.on('send_report', (data) => {
+        const { itemId, title, reason, userId } = data || {};
+        console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
+    });
 
     socket.on('disconnect', async () => {
         // Varre sockets de usuários comuns
@@ -799,6 +804,19 @@ app.post('/support/read', auth, async (req, res) => {
         return res.status(500).json({ error: 'Erro ao marcar mensagens como lidas' });
     }
 });
+
+app.post('/api/report', async (req, res) => {
+    try {
+        const { itemId, title, reason, userId } = req.body;
+        console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
+
+        return res.status(200).json({ success: true, message: 'Reporte recebido com sucesso!' });
+    } catch (err) {
+        console.error('Erro ao processar reporte:', err);
+        return res.status(500).json({ error: 'Erro interno ao salvar reporte' });
+    }
+});
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {

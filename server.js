@@ -361,43 +361,46 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Função genérica interna de upload para reuso
+async function handleImageUpload(file) {
+    if (STORAGE === "r2") {
+        const ext = file.originalname.split('.').pop() || 'jpg';
+        const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
+        await r2.send(
+            new PutObjectCommand({
+                Bucket: process.env.R2_BUCKET,
+                Key: fileName,
+                Body: file.buffer,
+                ContentType: file.mimetype,
+                CacheControl: 'public, max-age=31536000'
+            })
+        );
+        return `${process.env.R2_PUBLIC_URL}/${fileName}`;
+    }
+
+    if (STORAGE === "cloudinary") {
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                { folder: "avatars" },
+                (error, result) => {
+                    if (error) reject(error);
+                    else resolve(result);
+                }
+            );
+            streamifier.createReadStream(file.buffer).pipe(stream);
+        });
+        return result.secure_url;
+    }
+
+    throw new Error("Storage não configurado corretamente");
+}
+
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
-
-        if (STORAGE === "r2") {
-            const ext = req.file.originalname.split('.').pop();
-            const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
-
-            await r2.send(
-                new PutObjectCommand({
-                    Bucket: process.env.R2_BUCKET,
-                    Key: fileName,
-                    Body: req.file.buffer,
-                    ContentType: req.file.mimetype,
-                    CacheControl: 'public, max-age=31536000'
-                })
-            );
-
-            return res.json({ success: true, url: `${process.env.R2_PUBLIC_URL}/${fileName}` });
-        }
-
-        if (STORAGE === "cloudinary") {
-            const result = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    { folder: "avatars" },
-                    (error, result) => {
-                        if (error) reject(error);
-                        else resolve(result);
-                    }
-                );
-                streamifier.createReadStream(req.file.buffer).pipe(stream);
-            });
-
-            return res.json({ success: true, url: result.secure_url });
-        }
-
-        return res.status(500).json({ error: "Storage não configurado" });
+        const url = await handleImageUpload(req.file);
+        return res.json({ success: true, url });
     } catch (err) {
         console.error("UPLOAD ERROR:", err);
         return res.status(500).json({ error: "Erro no upload" });
@@ -516,7 +519,36 @@ app.get('/me', auth, async (req, res) => {
     }
 });
 
-// Editar Perfil do Próprio Usuário
+// ================= ROTAS DE PERFIL COMPATÍVEIS COM O APP ANDROID =================
+
+// GET /api/user/profile (Responde ao app Android para carregar os dados)
+app.get('/api/user/profile', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId).select('-password');
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile || {},
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
+        });
+    } catch (err) {
+        console.error("ERRO GET PERFIL:", err);
+        return res.status(500).json({ error: 'Erro interno ao buscar perfil' });
+    }
+});
+
+// PUT /profile (Sua rota antiga em JSON)
 app.put('/profile', auth, async (req, res) => {
     const { name, avatar, profile = {} } = req.body;
     try {
@@ -546,6 +578,57 @@ app.put('/profile', auth, async (req, res) => {
         });
     } catch (err) {
         console.error("ERRO AO ATUALIZAR PERFIL:", err);
+        return res.status(500).json({ error: 'Erro interno ao salvar perfil' });
+    }
+});
+
+// PUT /api/user/profile (Rota com Multer para Multipart, recebendo arquivo e texto do Android)
+app.put('/api/user/profile', auth, upload.single('avatar'), async (req, res) => {
+    try {
+        const { name, bio, profile } = req.body;
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        if (typeof name === 'string' && name.trim()) {
+            user.name = name.trim();
+        }
+
+        let userBio = bio || "";
+        if (profile) {
+            try {
+                const parsed = typeof profile === 'string' ? JSON.parse(profile) : profile;
+                if (parsed.bio) userBio = parsed.bio;
+            } catch (e) {
+                userBio = profile;
+            }
+        }
+        
+        user.profile = { ...(user.profile || {}), bio: userBio };
+
+        if (req.file) {
+            user.avatar = await handleImageUpload(req.file);
+        }
+
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'Perfil atualizado com sucesso!',
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
+        });
+    } catch (err) {
+        console.error("ERRO AO SALVAR PERFIL COMPLETO:", err);
         return res.status(500).json({ error: 'Erro interno ao salvar perfil' });
     }
 });

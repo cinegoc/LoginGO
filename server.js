@@ -17,6 +17,18 @@ const streamifier = require('streamifier');
 
 require('dotenv').config();
 
+// ================= SUPORTE A CONFIGURAÇÃO EM BASE64 =================
+if (process.env.CONFIG_BASE64) {
+    try {
+        const decodedConfig = Buffer.from(process.env.CONFIG_BASE64, 'base64').toString('utf8');
+        const parsedConfig = JSON.parse(decodedConfig);
+        Object.assign(process.env, parsedConfig);
+        console.log('✅ Configurações carregadas via Base64 com sucesso.');
+    } catch (err) {
+        console.error('❌ Erro ao decodificar CONFIG_BASE64:', err.message);
+    }
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -50,7 +62,6 @@ async function setOfflineUser(userId, ioInstance, isAgent = false) {
         const user = await User.findById(uIdStr);
         if (!user) return;
 
-        // Se for agente, só marca offline globalmente se não restar nenhuma aba/conexão de agente ativa
         if (user.studio) {
             const totalAgentSockets = Array.from(agentActiveSockets.values()).reduce((acc, set) => acc + set.size, 0);
             if (totalAgentSockets > 0) return; 
@@ -79,7 +90,6 @@ async function setOfflineUser(userId, ioInstance, isAgent = false) {
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
-    // 1. Cliente entra na própria sala isolada
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
@@ -104,7 +114,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 2. Administrador entra na sala global/administrativa
     socket.on('join_admin_support', async (adminId) => {
         const targetId = adminId || (socket.handshake.auth && socket.handshake.auth.userId);
         socket.join('admin_support_room');
@@ -137,14 +146,12 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 3. Atualização de status online do suporte
     socket.on('support_status', (data) => {
         if (data) {
             io.emit('support_status', data);
         }
     });
 
-    // 4. Indicador de digitação do Usuário para o Admin
     socket.on('user_typing', (data) => {
         if (data && data.userId) {
             const payload = { 
@@ -156,7 +163,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 5. Indicador de digitação do Admin para o Usuário específico
     socket.on('support_typing', (data) => {
         if (data && data.userId) {
             io.to(`user_${data.userId}`).emit('support_typing', { 
@@ -167,7 +173,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 6. Marcar mensagens como lidas
     socket.on('mark_as_read', async (userId) => {
         const uId = typeof userId === 'string' ? userId : (userId && userId.userId ? userId.userId : null);
         if (!uId || !mongoose.Types.ObjectId.isValid(uId)) return;
@@ -186,7 +191,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 7. Buscar status do suporte com checagem rigorosa de agente ativo real
     socket.on('get_support_status', async (userId) => {
         try {
             let activeAgent = null;
@@ -219,12 +223,11 @@ io.on('connection', (socket) => {
             console.error('[Socket] Erro ao buscar status do suporte:', e);
         }
     });
-    
-    // 8. Receber reporte via Socket e notificar a sala admin
+
     socket.on('send_report', async (data) => {
         const { itemId, title, reason, userId } = data || {};
         console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
-        
+
         try {
             if (itemId || reason) {
                 const newReport = await Report.create({ itemId, title, reason, userId });
@@ -236,7 +239,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', async () => {
-        // Varre sockets de usuários comuns
         for (let [userId, socketSet] of userActiveSockets.entries()) {
             if (socketSet.has(socket.id)) {
                 socketSet.delete(socket.id);
@@ -246,7 +248,6 @@ io.on('connection', (socket) => {
                 break;
             }
         }
-        // Varre sockets de agentes/admins
         for (let [adminId, socketSet] of agentActiveSockets.entries()) {
             if (socketSet.has(socket.id)) {
                 socketSet.delete(socket.id);
@@ -356,48 +357,63 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const upload = multer({ storage: multer.memoryStorage() });
+// ================= MULTER COM TRAVA DE SEGURANÇA =================
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 2 * 1024 * 1024 }, // Máximo 2MB por foto
+    fileFilter: (req, file, cb) => {
+        const allowedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
+        if (allowedMime.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Apenas imagens em formato JPG, PNG ou WEBP são permitidas.'));
+        }
+    }
+});
+
+// Função auxiliar reutilizável para upload no storage
+async function uploadToStorage(file) {
+    if (STORAGE === "r2") {
+        const ext = file.originalname.split('.').pop() || 'jpg';
+        const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
+        await r2.send(
+            new PutObjectCommand({
+                Bucket: process.env.R2_BUCKET,
+                Key: fileName,
+                Body: file.buffer,
+                ContentType: file.mimetype,
+                CacheControl: 'public, max-age=31536000'
+            })
+        );
+        return `${process.env.R2_PUBLIC_URL}/${fileName}`;
+    }
+
+    if (STORAGE === "cloudinary") {
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                { folder: "avatars" },
+                (error, result) => {
+                    if (error) reject(error);
+                    else resolve(result);
+                }
+            );
+            streamifier.createReadStream(file.buffer).pipe(stream);
+        });
+        return result.secure_url;
+    }
+
+    throw new Error("Provedor de armazenamento não configurado no servidor");
+}
 
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
-
-        if (STORAGE === "r2") {
-            const ext = req.file.originalname.split('.').pop();
-            const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
-
-            await r2.send(
-                new PutObjectCommand({
-                    Bucket: process.env.R2_BUCKET,
-                    Key: fileName,
-                    Body: req.file.buffer,
-                    ContentType: req.file.mimetype,
-                    CacheControl: 'public, max-age=31536000'
-                })
-            );
-
-            return res.json({ success: true, url: `${process.env.R2_PUBLIC_URL}/${fileName}` });
-        }
-
-        if (STORAGE === "cloudinary") {
-            const result = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    { folder: "avatars" },
-                    (error, result) => {
-                        if (error) reject(error);
-                        else resolve(result);
-                    }
-                );
-                streamifier.createReadStream(req.file.buffer).pipe(stream);
-            });
-
-            return res.json({ success: true, url: result.secure_url });
-        }
-
-        return res.status(500).json({ error: "Storage não configurado" });
+        const uploadedUrl = await uploadToStorage(req.file);
+        return res.json({ success: true, url: uploadedUrl });
     } catch (err) {
         console.error("UPLOAD ERROR:", err);
-        return res.status(500).json({ error: "Erro no upload" });
+        return res.status(500).json({ error: err.message || "Erro no upload" });
     }
 });
 
@@ -502,20 +518,45 @@ app.get('/me', auth, async (req, res) => {
     }
 });
 
-app.put('/profile', auth, async (req, res) => {
-    const { name, avatar, profile = {} } = req.body;
+// ================= ROTA DE EDIÇÃO DE PERFIL UNIFICADA (TEXTO + IMAGEM) =================
+app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-        if (typeof name === 'string') user.name = name.trim();
-        if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
+        const { name, avatarUrl } = req.body;
+        let profileData = {};
 
-        user.profile = { ...user.profile, ...profile };
+        if (req.body.profile) {
+            try {
+                profileData = typeof req.body.profile === 'string' 
+                    ? JSON.parse(req.body.profile) 
+                    : req.body.profile;
+            } catch (e) {
+                profileData = {};
+            }
+        }
+
+        // 1. Atualização do Nome
+        if (typeof name === 'string' && name.trim()) {
+            user.name = name.trim();
+        }
+
+        // 2. Processamento do Avatar (Novo arquivo enviado via Multipart OU URL enviada via JSON)
+        if (req.file) {
+            const uploadedAvatarUrl = await uploadToStorage(req.file);
+            user.avatar = uploadedAvatarUrl;
+        } else if (typeof avatarUrl === 'string' && avatarUrl.trim()) {
+            user.avatar = avatarUrl.trim();
+        }
+
+        // 3. Atualização do objeto profile dinâmico
+        user.profile = { ...user.profile, ...profileData };
         await user.save();
 
         return res.json({
             success: true,
+            message: 'Perfil atualizado com sucesso!',
             user: {
                 id: user._id,
                 name: user.name,
@@ -529,8 +570,8 @@ app.put('/profile', auth, async (req, res) => {
             }
         });
     } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
+        console.error("ERRO AO ATUALIZAR PERFIL:", err);
+        return res.status(500).json({ error: err.message || 'Erro ao atualizar perfil' });
     }
 });
 
@@ -724,17 +765,14 @@ app.get('/support/admin/chats', auth, async (req, res) => {
         }
 
         const chats = await SupportMessage.aggregate([
-            { $sort: { createdAt: -1 } },
-            {
-                $group: {
+            { $sort: { createdAt: -1 } },             {$group: {
                     _id: "$userId",
                     lastMessage: { $first: "$message" },
                     lastMessageDate: { $first: "$createdAt" },
                     lastMessageStatus: { $first: "$status" },
                     lastMessageSenderModel: { $first: "$senderModel" },
                     unreadCount: {
-                        $sum: {
-                            $cond: [
+                        $sum: {$cond: [
                                 { $and: [
                                     { $eq: ["$senderModel", "user"] },
                                     { $ne: ["$status", "read"] }
@@ -811,7 +849,7 @@ app.post('/support/read', auth, async (req, res) => {
 
         const now = new Date();
         await SupportMessage.updateMany(
-            { userId: chatUserId, senderId: { $ne: req.userId }, status: { $ne: 'read' } },
+            { userId: chatUserId, senderId: { $ne: req.userId }, status: {$ne: 'read' } },
             { $set: { status: 'read', readAt: now } }
         );
 
@@ -826,8 +864,6 @@ app.post('/support/read', auth, async (req, res) => {
 });
 
 // ================= ROTAS DE REPORTES =================
-
-// 1. Buscar todos os reportes (Usado pelo ReportsUX.Runtime no Android)
 app.get('/api/reports', async (req, res) => {
     try {
         const reports = await Report.find().sort({ createdAt: -1 });
@@ -838,7 +874,6 @@ app.get('/api/reports', async (req, res) => {
     }
 });
 
-// 2. Criar um novo reporte via HTTP
 app.post('/api/report', async (req, res) => {
     try {
         const { itemId, title, reason, userId } = req.body;
@@ -846,7 +881,6 @@ app.post('/api/report', async (req, res) => {
 
         const newReport = await Report.create({ itemId, title, reason, userId });
 
-        // Notifica admins conectados via WebSocket em tempo real
         io.to('admin_support_room').emit('new_report', newReport);
 
         return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!', report: newReport });
@@ -856,7 +890,6 @@ app.post('/api/report', async (req, res) => {
     }
 });
 
-// 3. Deletar/Resolver reporte por ID
 app.delete('/api/reports/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -875,7 +908,6 @@ app.delete('/api/reports/:id', async (req, res) => {
         return res.status(500).json({ error: 'Erro interno ao deletar reporte' });
     }
 });
-
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {

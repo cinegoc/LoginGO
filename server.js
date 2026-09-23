@@ -17,17 +17,12 @@ const streamifier = require('streamifier');
 
 require('dotenv').config();
 
-// ================= SUPORTE A CONFIGURAÇÃO EM BASE64 =================
-if (process.env.CONFIG_BASE64) {
-    try {
-        const decodedConfig = Buffer.from(process.env.CONFIG_BASE64, 'base64').toString('utf8');
-        const parsedConfig = JSON.parse(decodedConfig);
-        Object.assign(process.env, parsedConfig);
-        console.log('✅ Configurações carregadas via Base64 com sucesso.');
-    } catch (err) {
-        console.error('❌ Erro ao decodificar CONFIG_BASE64:', err.message);
-    }
-}
+// ================= CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE =================
+const PORT = process.env.PORT || 3000;
+const MONGO_URL = process.env.MONGO_URL || process.env.MONGODB_URI;
+const JWT_SECRET = process.env.JWT_SECRET || "CHAVE_SECRETA_CINEGO_2026";
+const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
+const STORAGE = process.env.STORAGE || "r2";
 
 const app = express();
 const server = http.createServer(app);
@@ -39,11 +34,12 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
+// Rota de Health Check
 app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
-// Mapas de controle separados para usuários comuns e agentes de suporte (studio: true)
+// Mapas de controle de conexões Socket para usuários e agentes (studio: true)
 const userActiveSockets = new Map();
 const agentActiveSockets = new Map();
 
@@ -258,8 +254,7 @@ io.on('connection', (socket) => {
     });
 });
 
-const API_KEY_SECRET = process.env.APP_API_KEY || "SUA_CHAVE_MESTRA_STREAMING_2026";
-
+// Middleware de verificação de API KEY
 function verifyApiKey(req, res, next) {
     const clientApiKey = req.headers['x-api-key'];
     if (!clientApiKey || clientApiKey !== API_KEY_SECRET) {
@@ -270,8 +265,7 @@ function verifyApiKey(req, res, next) {
 
 app.use(verifyApiKey);
 
-const STORAGE = process.env.STORAGE || "r2";
-
+// ================= SCHEMAS E MODELOS MONGOOSE =================
 const UserSchema = new mongoose.Schema({
     email: { type: String, unique: true },
     password: String,
@@ -311,10 +305,16 @@ const ReportSchema = new mongoose.Schema({
 
 const Report = mongoose.model('Report', ReportSchema);
 
-mongoose.connect(process.env.MONGO_URL)
-.then(() => console.log('MongoDB conectado com sucesso'))
-.catch(err => console.error('Erro ao conectar no MongoDB:', err));
+// Conexão com o Banco de Dados
+if (!MONGO_URL) {
+    console.error('❌ [ERRO BANCO] MONGO_URL não foi informada no arquivo .env');
+} else {
+    mongoose.connect(MONGO_URL)
+        .then(() => console.log('✅ MongoDB conectado com sucesso'))
+        .catch(err => console.error('❌ Erro ao conectar no MongoDB:', err.message));
+}
 
+// Helpers de código de recuperação
 function generateRecoveryCode() {
     const a = Math.floor(1000 + Math.random() * 9000);
     const b = Math.floor(1000 + Math.random() * 9000);
@@ -329,19 +329,21 @@ async function createUniqueRecoveryCode() {
     return code;
 }
 
+// Middleware de Autenticação JWT
 function auth(req, res, next) {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Token de sessão ausente' });
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
         req.userId = decoded.id;
         next();
-    } catch {
+    } catch (err) {
         return res.status(401).json({ error: 'Token de sessão inválido ou expirado' });
     }
 }
 
+// Configuração do Multer e Storage R2 / Cloudinary
 const r2 = new S3Client({
     region: 'auto',
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -357,80 +359,66 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// ================= MULTER COM TRAVA DE SEGURANÇA =================
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 }, // Aumentado limite para 5MB
-    fileFilter: (req, file, cb) => {
-        const allowedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
-        if (allowedMime.includes(file.mimetype)) {
-            cb(null, true);
-        } else {
-            cb(new Error('Apenas imagens em formato JPG, PNG ou WEBP são permitidas.'));
-        }
-    }
-});
-
-// Função auxiliar reutilizável para upload no storage
-async function uploadToStorage(file) {
-    if (STORAGE === "r2") {
-        const ext = file.originalname ? file.originalname.split('.').pop() : 'jpg';
-        const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
-
-        await r2.send(
-            new PutObjectCommand({
-                Bucket: process.env.R2_BUCKET,
-                Key: fileName,
-                Body: file.buffer,
-                ContentType: file.mimetype || 'image/jpeg',
-                CacheControl: 'public, max-age=31536000'
-            })
-        );
-        const baseUrl = (process.env.R2_PUBLIC_URL || '').replace(/\/$/, '');
-        return `${baseUrl}/${fileName}`;
-    }
-
-    if (STORAGE === "cloudinary") {
-        const result = await new Promise((resolve, reject) => {
-            const stream = cloudinary.uploader.upload_stream(
-                { folder: "avatars" },
-                (error, result) => {
-                    if (error) reject(error);
-                    else resolve(result);
-                }
-            );
-            streamifier.createReadStream(file.buffer).pipe(stream);
-        });
-        return result.secure_url;
-    }
-
-    throw new Error("Provedor de armazenamento não configurado no servidor");
-}
+const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
-        const uploadedUrl = await uploadToStorage(req.file);
-        return res.json({ success: true, url: uploadedUrl });
+
+        if (STORAGE === "r2") {
+            const ext = req.file.originalname.split('.').pop();
+            const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+
+            await r2.send(
+                new PutObjectCommand({
+                    Bucket: process.env.R2_BUCKET,
+                    Key: fileName,
+                    Body: req.file.buffer,
+                    ContentType: req.file.mimetype,
+                    CacheControl: 'public, max-age=31536000'
+                })
+            );
+
+            return res.json({ success: true, url: `${process.env.R2_PUBLIC_URL}/${fileName}` });
+        }
+
+        if (STORAGE === "cloudinary") {
+            const result = await new Promise((resolve, reject) => {
+                const stream = cloudinary.uploader.upload_stream(
+                    { folder: "avatars" },
+                    (error, result) => {
+                        if (error) reject(error);
+                        else resolve(result);
+                    }
+                );
+                streamifier.createReadStream(req.file.buffer).pipe(stream);
+            });
+
+            return res.json({ success: true, url: result.secure_url });
+        }
+
+        return res.status(500).json({ error: "Storage não configurado" });
     } catch (err) {
         console.error("UPLOAD ERROR:", err);
-        return res.status(500).json({ error: err.message || "Erro no upload" });
+        return res.status(500).json({ error: "Erro no upload" });
     }
 });
 
+// ================= AUTENTICAÇÃO E CONTA DE USUÁRIO =================
 app.post('/register', async (req, res) => {
     const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
 
     try {
-        const exists = await User.findOne({ email });
+        const cleanEmail = email.trim().toLowerCase();
+        const exists = await User.findOne({ email: cleanEmail });
         if (exists) return res.status(400).json({ error: 'Email já cadastrado' });
 
         const hash = await bcrypt.hash(password, 10);
         const recoveryCode = await createUniqueRecoveryCode();
 
         const user = await User.create({ 
-            email, 
+            email: cleanEmail, 
             password: hash, 
             name, 
             avatar, 
@@ -457,21 +445,30 @@ app.post('/register', async (req, res) => {
             }
         });
     } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
+        console.error("ERRO NO CADASTRO:", err);
+        return res.status(500).json({ error: 'Erro interno no cadastro' });
     }
 });
 
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Preencha e-mail e senha' });
+    }
+
     try {
-        const user = await User.findOne({ email });
+        const cleanEmail = email.trim().toLowerCase();
+        const user = await User.findOne({ email: cleanEmail });
         if (!user) return res.status(400).json({ error: 'Usuário não encontrado' });
+
+        if (!user.password) {
+            return res.status(400).json({ error: 'Usuário sem senha cadastrada no banco' });
+        }
 
         const ok = await bcrypt.compare(password, user.password);
         if (!ok) return res.status(401).json({ error: 'Senha inválida' });
 
-        const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+        const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '30d' });
 
         return res.json({
             token,
@@ -483,14 +480,14 @@ app.post('/login', async (req, res) => {
                 plan: user.plan || 'FREE',
                 studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
-                profile: user.profile,
+                profile: user.profile || {},
                 isOnline: user.isOnline,
                 lastSeen: user.lastSeen
             }
         });
     } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Erro interno' });
+        console.error("ERRO NO LOGIN:", err);
+        return res.status(500).json({ error: 'Erro interno no servidor', details: err.message });
     }
 });
 
@@ -514,63 +511,33 @@ app.get('/me', auth, async (req, res) => {
             }
         });
     } catch (err) {
-        console.error("ERRO EM /ME:", err);
+        console.error(err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
 
-// ================= ROTA DE EDIÇÃO DE PERFIL UNIFICADA (TEXTO + IMAGEM) =================
-app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
+// Editar Perfil do Próprio Usuário
+app.put('/profile', auth, async (req, res) => {
+    const { name, avatar, profile = {} } = req.body;
     try {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-        const { name, bio, avatarUrl } = req.body;
-        let profileData = {};
+        if (typeof name === 'string' && name.trim()) user.name = name.trim();
+        if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
 
-        if (req.body.profile) {
-            try {
-                profileData = typeof req.body.profile === 'string' 
-                    ? JSON.parse(req.body.profile) 
-                    : req.body.profile;
-            } catch (e) {
-                profileData = {};
-            }
-        }
-
-        if (bio !== undefined && bio !== null) {
-            profileData.bio = bio;
-        }
-
-        // 1. Atualização do Nome
-        if (typeof name === 'string' && name.trim()) {
-            user.name = name.trim();
-        }
-
-        // 2. Processamento do Avatar (Arquivo enviado via Multipart OU URL enviada via Body)
-        if (req.file) {
-            const uploadedAvatarUrl = await uploadToStorage(req.file);
-            user.avatar = uploadedAvatarUrl;
-        } else if (typeof avatarUrl === 'string' && avatarUrl.trim()) {
-            user.avatar = avatarUrl.trim();
-        }
-
-        // 3. Atualização e Persistência Garantida do Objeto profile no Mongoose
-        const currentProfile = (typeof user.profile === 'object' && user.profile !== null) ? user.profile : {};
-        user.profile = { ...currentProfile, ...profileData };
-        user.markModified('profile'); // <--- CRUCIAL PARA SALVAR CAMPOS MIXED NO MONGOOSE
-
+        user.profile = { ...user.profile, ...profile };
         await user.save();
 
         return res.json({
             success: true,
-            message: 'Perfil atualizado com sucesso!',
             user: {
                 id: user._id,
                 name: user.name,
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile,
                 isOnline: user.isOnline,
@@ -579,7 +546,7 @@ app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
         });
     } catch (err) {
         console.error("ERRO AO ATUALIZAR PERFIL:", err);
-        return res.status(500).json({ error: err.message || 'Erro ao atualizar perfil' });
+        return res.status(500).json({ error: 'Erro interno ao salvar perfil' });
     }
 });
 
@@ -674,12 +641,13 @@ app.put('/change-email', auth, async (req, res) => {
         const ok = await bcrypt.compare(currentPassword, user.password);
         if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
 
-        const exists = await User.findOne({ email: newEmail });
+        const cleanEmail = newEmail.trim().toLowerCase();
+        const exists = await User.findOne({ email: cleanEmail });
         if (exists && exists._id.toString() !== user._id.toString()) {
             return res.status(400).json({ error: 'Este e-mail já está em uso' });
         }
 
-        user.email = newEmail.trim();
+        user.email = cleanEmail;
         await user.save();
 
         return res.json({
@@ -691,6 +659,7 @@ app.put('/change-email', auth, async (req, res) => {
                 email: user.email,
                 avatar: user.avatar,
                 plan: user.plan || 'FREE',
+                studio: user.studio,
                 recoveryCode: user.recoveryCode,
                 profile: user.profile
             }
@@ -706,7 +675,8 @@ app.post('/recover-with-code', async (req, res) => {
     if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
 
     try {
-        const user = await User.findOne({ email, recoveryCode });
+        const cleanEmail = email.trim().toLowerCase();
+        const user = await User.findOne({ email: cleanEmail, recoveryCode });
         if (!user) return res.status(400).json({ error: 'Código inválido' });
 
         user.password = await bcrypt.hash(newPassword, 10);
@@ -719,27 +689,134 @@ app.post('/recover-with-code', async (req, res) => {
     }
 });
 
-app.put('/admin/change-plan', async (req, res) => {
+// ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO =================
+
+// 1. Listar todos os usuários cadastrados (Para o Painel de Controle Admin)
+app.get('/admin/users', auth, async (req, res) => {
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado: Apenas o estúdio tem acesso ao gerenciamento de usuários.' });
+        }
+
+        const users = await User.find().select('-password').sort({ createdAt: -1 });
+        return res.json({ success: true, count: users.length, users });
+    } catch (err) {
+        console.error('[ADMIN LIST ERRO]:', err);
+        return res.status(500).json({ error: 'Erro ao listar usuários' });
+    }
+});
+
+// 2. Editar qualquer perfil de usuário através do Painel Admin
+app.put('/admin/user/:id', auth, async (req, res) => {
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado: Apenas administradores podem editar contas.' });
+        }
+
+        const { name, email, avatar, plan, studio, profile } = req.body;
+        const updateFields = {};
+
+        if (name !== undefined) updateFields.name = name.trim();
+        if (email !== undefined) updateFields.email = email.trim().toLowerCase();
+        if (avatar !== undefined) updateFields.avatar = avatar;
+        if (plan !== undefined) updateFields.plan = plan.toUpperCase();
+        if (studio !== undefined) updateFields.studio = Boolean(studio);
+        if (profile !== undefined) updateFields.profile = profile;
+
+        const updatedUser = await User.findByIdAndUpdate(
+            req.params.id,
+            { $set: updateFields },
+            { new: true }
+        ).select('-password');
+
+        if (!updatedUser) {
+            return res.status(404).json({ error: 'Usuário não encontrado' });
+        }
+
+        return res.json({
+            success: true,
+            message: 'Perfil de usuário atualizado no painel com sucesso!',
+            user: updatedUser
+        });
+    } catch (err) {
+        console.error('[ADMIN EDIT USER ERRO]:', err);
+        return res.status(500).json({ error: 'Erro ao editar usuário via painel admin' });
+    }
+});
+
+// 3. Alterar plano de usuário por e-mail
+app.put('/admin/change-plan', auth, async (req, res) => {
     const { email, plan } = req.body;
     if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
 
     try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
         const user = await User.findOneAndUpdate(
-            { email },
+            { email: cleanEmail },
             { plan: plan.toUpperCase() },
             { new: true }
-        );
+        ).select('-password');
 
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
         return res.json({
             success: true,
             message: `Plano alterado para ${user.plan}`,
-            user: { id: user._id, email: user.email, plan: user.plan }
+            user
         });
     } catch (err) {
         console.error(err);
         return res.status(500).json({ error: 'Erro ao alterar plano' });
+    }
+});
+
+// 4. Alternar status de Studio/Agente de Suporte de um Usuário
+app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        user.studio = !user.studio;
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: `Permissão de Studio ${user.studio ? 'ativada' : 'desativada'} com sucesso!`,
+            studio: user.studio
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao alterar permissão de estúdio' });
+    }
+});
+
+// 5. Excluir conta de usuário via painel Admin
+app.delete('/admin/user/:id', auth, async (req, res) => {
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+
+        const deleted = await User.findByIdAndDelete(req.params.id);
+        if (!deleted) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({ success: true, message: 'Usuário removido com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao deletar usuário' });
     }
 });
 
@@ -888,7 +965,6 @@ app.post('/api/report', async (req, res) => {
         console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
 
         const newReport = await Report.create({ itemId, title, reason, userId });
-
         io.to('admin_support_room').emit('new_report', newReport);
 
         return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!', report: newReport });
@@ -917,7 +993,7 @@ app.delete('/api/reports/:id', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3000;
+// Inicialização do Servidor
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor unificado do Prime Studio rodando na porta ${PORT}`);
+    console.log(`🚀 Servidor unificado do Prime Studio rodando na porta ${PORT}`);
 });

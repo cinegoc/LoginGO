@@ -360,7 +360,7 @@ cloudinary.config({
 // ================= MULTER COM TRAVA DE SEGURANÇA =================
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 2 * 1024 * 1024 }, // Máximo 2MB por foto
+    limits: { fileSize: 5 * 1024 * 1024 }, // Aumentado limite para 5MB
     fileFilter: (req, file, cb) => {
         const allowedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
         if (allowedMime.includes(file.mimetype)) {
@@ -374,7 +374,7 @@ const upload = multer({
 // Função auxiliar reutilizável para upload no storage
 async function uploadToStorage(file) {
     if (STORAGE === "r2") {
-        const ext = file.originalname.split('.').pop() || 'jpg';
+        const ext = file.originalname ? file.originalname.split('.').pop() : 'jpg';
         const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
 
         await r2.send(
@@ -382,11 +382,12 @@ async function uploadToStorage(file) {
                 Bucket: process.env.R2_BUCKET,
                 Key: fileName,
                 Body: file.buffer,
-                ContentType: file.mimetype,
+                ContentType: file.mimetype || 'image/jpeg',
                 CacheControl: 'public, max-age=31536000'
             })
         );
-        return `${process.env.R2_PUBLIC_URL}/${fileName}`;
+        const baseUrl = (process.env.R2_PUBLIC_URL || '').replace(/\/$/, '');
+        return `${baseUrl}/${fileName}`;
     }
 
     if (STORAGE === "cloudinary") {
@@ -507,13 +508,13 @@ app.get('/me', auth, async (req, res) => {
                 plan: user.plan || 'FREE',
                 studio: user.studio !== undefined ? user.studio : false,
                 recoveryCode: user.recoveryCode,
-                profile: user.profile,
+                profile: user.profile || {},
                 isOnline: user.isOnline,
                 lastSeen: user.lastSeen
             }
         });
     } catch (err) {
-        console.error(err);
+        console.error("ERRO EM /ME:", err);
         return res.status(500).json({ error: 'Erro interno' });
     }
 });
@@ -524,7 +525,7 @@ app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
         const user = await User.findById(req.userId);
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-        const { name, avatarUrl } = req.body;
+        const { name, bio, avatarUrl } = req.body;
         let profileData = {};
 
         if (req.body.profile) {
@@ -537,12 +538,16 @@ app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
             }
         }
 
+        if (bio !== undefined && bio !== null) {
+            profileData.bio = bio;
+        }
+
         // 1. Atualização do Nome
         if (typeof name === 'string' && name.trim()) {
             user.name = name.trim();
         }
 
-        // 2. Processamento do Avatar (Novo arquivo enviado via Multipart OU URL enviada via JSON)
+        // 2. Processamento do Avatar (Arquivo enviado via Multipart OU URL enviada via Body)
         if (req.file) {
             const uploadedAvatarUrl = await uploadToStorage(req.file);
             user.avatar = uploadedAvatarUrl;
@@ -550,8 +555,11 @@ app.put('/profile', auth, upload.single('avatar'), async (req, res) => {
             user.avatar = avatarUrl.trim();
         }
 
-        // 3. Atualização do objeto profile dinâmico
-        user.profile = { ...user.profile, ...profileData };
+        // 3. Atualização e Persistência Garantida do Objeto profile no Mongoose
+        const currentProfile = (typeof user.profile === 'object' && user.profile !== null) ? user.profile : {};
+        user.profile = { ...currentProfile, ...profileData };
+        user.markModified('profile'); // <--- CRUCIAL PARA SALVAR CAMPOS MIXED NO MONGOOSE
+
         await user.save();
 
         return res.json({

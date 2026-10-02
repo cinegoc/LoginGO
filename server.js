@@ -86,78 +86,6 @@ async function setOfflineUser(userId, ioInstance, isAgent = false) {
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
-    // ----------- SOCKETS DO GERENCIAMENTO DO PAINEL ADMIN (GESTÃO TOTAL DE USUÁRIOS) -----------
-    socket.on('request_all_users', async () => {
-        try {
-            const users = await User.find().select('-password').sort({ createdAt: -1 });
-            socket.emit('response_all_users', users);
-        } catch (err) {
-            console.error('[Socket Admin] Erro ao buscar todos os usuários:', err);
-            socket.emit('error_message', 'Erro ao carregar lista de usuários');
-        }
-    });
-
-    socket.on('update_user_permissions', async (data) => {
-        try {
-            const { userId, plan, studio } = data || {};
-            if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
-
-            const updateFields = {};
-            if (plan !== undefined) updateFields.plan = plan.toString().toUpperCase();
-            if (studio !== undefined) updateFields.studio = Boolean(studio);
-
-            const updatedUser = await User.findByIdAndUpdate(
-                userId,
-                { $set: updateFields },
-                { new: true }
-            ).select('-password');
-
-            if (updatedUser) {
-                // Notifica a sala admin que os dados mudaram
-                io.to('admin_support_room').emit('user_permissions_updated', updatedUser);
-                socket.emit('user_permissions_updated', updatedUser);
-
-                // Notifica em tempo real a própria sala do usuário
-                io.to(`user_${userId}`).emit('user_permissions_updated', updatedUser);
-                io.to(userId.toString()).emit('user_permissions_updated', updatedUser);
-            }
-        } catch (err) {
-            console.error('[Socket Admin] Erro ao atualizar permissões:', err);
-            socket.emit('error_message', 'Erro ao atualizar permissões do usuário');
-        }
-    });
-
-    socket.on('update_user_full_data', async (data) => {
-        try {
-            const { userId, name, email, avatar, plan, studio, profile } = data || {};
-            if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
-
-            const updateFields = {};
-            if (name !== undefined) updateFields.name = name.trim();
-            if (email !== undefined) updateFields.email = email.trim().toLowerCase();
-            if (avatar !== undefined) updateFields.avatar = avatar;
-            if (plan !== undefined) updateFields.plan = plan.toString().toUpperCase();
-            if (studio !== undefined) updateFields.studio = Boolean(studio);
-            if (profile !== undefined) updateFields.profile = profile;
-
-            const updatedUser = await User.findByIdAndUpdate(
-                userId,
-                { $set: updateFields },
-                { new: true }
-            ).select('-password');
-
-            if (updatedUser) {
-                io.to('admin_support_room').emit('user_updated', updatedUser);
-                socket.emit('user_updated', updatedUser);
-                io.to(`user_${userId}`).emit('user_updated', updatedUser);
-            }
-        } catch (err) {
-            console.error('[Socket Admin] Erro ao atualizar dados gerais:', err);
-            socket.emit('error_message', 'Erro ao atualizar dados do usuário');
-        }
-    });
-
-    // ----------- SOCKETS ORIGINAIS MANTIDOS -----------
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
@@ -593,7 +521,6 @@ app.get('/me', auth, async (req, res) => {
 
 // ================= ROTAS DE PERFIL COMPATÍVEIS COM O APP ANDROID =================
 
-// GET /api/user/profile (Responde ao app Android para carregar os dados)
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId).select('-password');
@@ -620,7 +547,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-// PUT /profile (Sua rota antiga em JSON)
 app.put('/profile', auth, async (req, res) => {
     const { name, avatar, profile = {} } = req.body;
     try {
@@ -654,7 +580,6 @@ app.put('/profile', auth, async (req, res) => {
     }
 });
 
-// PUT /api/user/profile (Rota com Multer para Multipart, recebendo arquivo e texto do Android)
 app.put('/api/user/profile', auth, upload.single('avatar'), async (req, res) => {
     try {
         const { name, bio, profile } = req.body;
@@ -844,13 +769,19 @@ app.post('/recover-with-code', async (req, res) => {
     }
 });
 
-// ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO =================
+// ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO (CIRÚRGICO & UNIVERSAL) =================
 
-// 1. Listar todos os usuários cadastrados (Para o Painel de Controle Admin)
-app.get('/admin/users', auth, async (req, res) => {
+// Handler genérico de checagem de permissão Admin
+async function checkAdminPermission(userId) {
+    const admin = await User.findById(userId);
+    return admin && admin.studio === true;
+}
+
+// 1. Listar todos os usuários cadastrados (Suporta GET /api/admin/users e GET /admin/users)
+const handleGetAdminUsers = async (req, res) => {
     try {
-        const admin = await User.findById(req.userId);
-        if (!admin || !admin.studio) {
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) {
             return res.status(403).json({ error: 'Acesso negado: Apenas o estúdio tem acesso ao gerenciamento de usuários.' });
         }
 
@@ -860,30 +791,42 @@ app.get('/admin/users', auth, async (req, res) => {
         console.error('[ADMIN LIST ERRO]:', err);
         return res.status(500).json({ error: 'Erro ao listar usuários' });
     }
-});
+};
 
-// 2. Editar qualquer perfil de usuário através do Painel Admin
-app.put('/admin/user/:id', auth, async (req, res) => {
+app.get('/api/admin/users', auth, handleGetAdminUsers);
+app.get('/admin/users', auth, handleGetAdminUsers);
+
+// 2. Editar QUALQUER campo de um usuário dinamicamente (Porta aberta para o futuro)
+// Suporta PUT /api/admin/users/:id e PUT /admin/user/:id
+const handleUpdateAdminUser = async (req, res) => {
     try {
-        const admin = await User.findById(req.userId);
-        if (!admin || !admin.studio) {
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) {
             return res.status(403).json({ error: 'Acesso negado: Apenas administradores podem editar contas.' });
         }
 
-        const { name, email, avatar, plan, studio, profile } = req.body;
-        const updateFields = {};
+        const updateData = { ...req.body };
 
-        if (name !== undefined) updateFields.name = name.trim();
-        if (email !== undefined) updateFields.email = email.trim().toLowerCase();
-        if (avatar !== undefined) updateFields.avatar = avatar;
-        if (plan !== undefined) updateFields.plan = plan.toUpperCase();
-        if (studio !== undefined) updateFields.studio = Boolean(studio);
-        if (profile !== undefined) updateFields.profile = profile;
+        // Proteção contra alteração direta de senha nesta rota (use a rota de reset-password)
+        delete updateData.password;
+
+        if (updateData.name && typeof updateData.name === 'string') {
+            updateData.name = updateData.name.trim();
+        }
+        if (updateData.email && typeof updateData.email === 'string') {
+            updateData.email = updateData.email.trim().toLowerCase();
+        }
+        if (updateData.plan && typeof updateData.plan === 'string') {
+            updateData.plan = updateData.plan.toUpperCase();
+        }
+        if (updateData.studio !== undefined) {
+            updateData.studio = Boolean(updateData.studio);
+        }
 
         const updatedUser = await User.findByIdAndUpdate(
             req.params.id,
-            { $set: updateFields },
-            { new: true }
+            { $set: updateData },
+            { new: true, runValidators: true }
         ).select('-password');
 
         if (!updatedUser) {
@@ -899,18 +842,54 @@ app.put('/admin/user/:id', auth, async (req, res) => {
         console.error('[ADMIN EDIT USER ERRO]:', err);
         return res.status(500).json({ error: 'Erro ao editar usuário via painel admin' });
     }
-});
+};
 
-// 3. Alterar plano de usuário por e-mail
+app.put('/api/admin/users/:id', auth, handleUpdateAdminUser);
+app.put('/admin/user/:id', auth, handleUpdateAdminUser);
+
+// 3. Redefinir senha de qualquer usuário pelo suporte com Hash Bcrypt
+// Suporta PUT /api/admin/users/:id/reset-password e PUT /admin/user/:id/reset-password
+const handleResetUserPassword = async (req, res) => {
+    try {
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) {
+            return res.status(403).json({ error: 'Acesso negado: Apenas administradores podem redefinir senhas.' });
+        }
+
+        const { newPassword } = req.body;
+        if (!newPassword || newPassword.trim().length < 4) {
+            return res.status(400).json({ error: 'Informe uma nova senha válida com no mínimo 4 caracteres.' });
+        }
+
+        const user = await User.findById(req.params.id);
+        if (!user) {
+            return res.status(404).json({ error: 'Usuário não encontrado' });
+        }
+
+        user.password = await bcrypt.hash(newPassword.trim(), 10);
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: `Senha do usuário ${user.name || user.email} redefinida com sucesso!`
+        });
+    } catch (err) {
+        console.error('[ADMIN RESET PASSWORD ERRO]:', err);
+        return res.status(500).json({ error: 'Erro ao redefinir senha do usuário' });
+    }
+};
+
+app.put('/api/admin/users/:id/reset-password', auth, handleResetUserPassword);
+app.put('/admin/user/:id/reset-password', auth, handleResetUserPassword);
+
+// 4. Alterar plano de usuário por e-mail (Rota legada)
 app.put('/admin/change-plan', auth, async (req, res) => {
     const { email, plan } = req.body;
     if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
 
     try {
-        const admin = await User.findById(req.userId);
-        if (!admin || !admin.studio) {
-            return res.status(403).json({ error: 'Acesso negado' });
-        }
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) return res.status(403).json({ error: 'Acesso negado' });
 
         const cleanEmail = email.trim().toLowerCase();
         const user = await User.findOneAndUpdate(
@@ -932,13 +911,11 @@ app.put('/admin/change-plan', auth, async (req, res) => {
     }
 });
 
-// 4. Alternar status de Studio/Agente de Suporte de um Usuário
+// 5. Alternar status de Studio/Agente de Suporte (Rota legada)
 app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
     try {
-        const admin = await User.findById(req.userId);
-        if (!admin || !admin.studio) {
-            return res.status(403).json({ error: 'Acesso negado' });
-        }
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) return res.status(403).json({ error: 'Acesso negado' });
 
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
@@ -957,13 +934,11 @@ app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
     }
 });
 
-// 5. Excluir conta de usuário via painel Admin
+// 6. Excluir conta de usuário via painel Admin
 app.delete('/admin/user/:id', auth, async (req, res) => {
     try {
-        const admin = await User.findById(req.userId);
-        if (!admin || !admin.studio) {
-            return res.status(403).json({ error: 'Acesso negado' });
-        }
+        const isAdmin = await checkAdminPermission(req.userId);
+        if (!isAdmin) return res.status(403).json({ error: 'Acesso negado' });
 
         const deleted = await User.findByIdAndDelete(req.params.id);
         if (!deleted) return res.status(404).json({ error: 'Usuário não encontrado' });

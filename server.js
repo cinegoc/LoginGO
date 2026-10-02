@@ -39,7 +39,7 @@ app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
 
-// Mapas de controle de conexões Socket para usuários e agentes (studio: true)
+// Mapas de controle de conexões Socket para usuários e agentes
 const userActiveSockets = new Map();
 const agentActiveSockets = new Map();
 
@@ -222,8 +222,6 @@ io.on('connection', (socket) => {
 
     socket.on('send_report', async (data) => {
         const { itemId, title, reason, userId } = data || {};
-        console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
-
         try {
             if (itemId || reason) {
                 const newReport = await Report.create({ itemId, title, reason, userId });
@@ -314,7 +312,6 @@ if (!MONGO_URL) {
         .catch(err => console.error('❌ Erro ao conectar no MongoDB:', err.message));
 }
 
-// Helpers de código de recuperação
 function generateRecoveryCode() {
     const a = Math.floor(1000 + Math.random() * 9000);
     const b = Math.floor(1000 + Math.random() * 9000);
@@ -361,7 +358,6 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Função genérica interna de upload para reuso
 async function handleImageUpload(file) {
     if (STORAGE === "r2") {
         const ext = file.originalname.split('.').pop() || 'jpg';
@@ -769,15 +765,13 @@ app.post('/recover-with-code', async (req, res) => {
     }
 });
 
-// ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO (CIRÚRGICO & UNIVERSAL) =================
+// ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO =================
 
-// Handler genérico de checagem de permissão Admin
 async function checkAdminPermission(userId) {
     const admin = await User.findById(userId);
     return admin && admin.studio === true;
 }
 
-// 1. Listar todos os usuários cadastrados (Suporta GET /api/admin/users e GET /admin/users)
 const handleGetAdminUsers = async (req, res) => {
     try {
         const isAdmin = await checkAdminPermission(req.userId);
@@ -796,8 +790,6 @@ const handleGetAdminUsers = async (req, res) => {
 app.get('/api/admin/users', auth, handleGetAdminUsers);
 app.get('/admin/users', auth, handleGetAdminUsers);
 
-// 2. Editar QUALQUER campo de um usuário dinamicamente (Porta aberta para o futuro)
-// Suporta PUT /api/admin/users/:id e PUT /admin/user/:id
 const handleUpdateAdminUser = async (req, res) => {
     try {
         const isAdmin = await checkAdminPermission(req.userId);
@@ -806,8 +798,6 @@ const handleUpdateAdminUser = async (req, res) => {
         }
 
         const updateData = { ...req.body };
-
-        // Proteção contra alteração direta de senha nesta rota (use a rota de reset-password)
         delete updateData.password;
 
         if (updateData.name && typeof updateData.name === 'string') {
@@ -847,8 +837,6 @@ const handleUpdateAdminUser = async (req, res) => {
 app.put('/api/admin/users/:id', auth, handleUpdateAdminUser);
 app.put('/admin/user/:id', auth, handleUpdateAdminUser);
 
-// 3. Redefinir senha de qualquer usuário pelo suporte com Hash Bcrypt
-// Suporta PUT /api/admin/users/:id/reset-password e PUT /admin/user/:id/reset-password
 const handleResetUserPassword = async (req, res) => {
     try {
         const isAdmin = await checkAdminPermission(req.userId);
@@ -882,7 +870,6 @@ const handleResetUserPassword = async (req, res) => {
 app.put('/api/admin/users/:id/reset-password', auth, handleResetUserPassword);
 app.put('/admin/user/:id/reset-password', auth, handleResetUserPassword);
 
-// 4. Alterar plano de usuário por e-mail (Rota legada)
 app.put('/admin/change-plan', auth, async (req, res) => {
     const { email, plan } = req.body;
     if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
@@ -911,7 +898,6 @@ app.put('/admin/change-plan', auth, async (req, res) => {
     }
 });
 
-// 5. Alternar status de Studio/Agente de Suporte (Rota legada)
 app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
     try {
         const isAdmin = await checkAdminPermission(req.userId);
@@ -934,7 +920,6 @@ app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
     }
 });
 
-// 6. Excluir conta de usuário via painel Admin
 app.delete('/admin/user/:id', auth, async (req, res) => {
     try {
         const isAdmin = await checkAdminPermission(req.userId);
@@ -1092,8 +1077,6 @@ app.get('/api/reports', async (req, res) => {
 app.post('/api/report', async (req, res) => {
     try {
         const { itemId, title, reason, userId } = req.body;
-        console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
-
         const newReport = await Report.create({ itemId, title, reason, userId });
         io.to('admin_support_room').emit('new_report', newReport);
 
@@ -1123,7 +1106,6 @@ app.delete('/api/reports/:id', async (req, res) => {
     }
 });
 
-// Inicialização do Servidor
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Servidor unificado do Prime Studio rodando na porta ${PORT}`);
 });

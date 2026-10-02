@@ -7,7 +7,11 @@ const multer = require('multer');
 const http = require('http');
 const { Server } = require('socket.io');
 
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const {
+    S3Client,
+    PutObjectCommand
+} = require('@aws-sdk/client-s3');
+
 const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
 
@@ -30,7 +34,7 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Rota de Health Check pública
+// Rota de Health Check
 app.get('/', (req, res) => {
     return res.status(200).json({ status: 'online', message: 'Servidor Unificado Prime Studio em execução' });
 });
@@ -218,6 +222,8 @@ io.on('connection', (socket) => {
 
     socket.on('send_report', async (data) => {
         const { itemId, title, reason, userId } = data || {};
+        console.log(`[REPORTE SOCKET] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
+
         try {
             if (itemId || reason) {
                 const newReport = await Report.create({ itemId, title, reason, userId });
@@ -337,7 +343,7 @@ function auth(req, res, next) {
     }
 }
 
-// Configuração de Upload R2 e Cloudinary
+// Configuração do Multer e Storage R2 / Cloudinary
 const r2 = new S3Client({
     region: 'auto',
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -355,6 +361,7 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Função genérica interna de upload para reuso
 async function handleImageUpload(file) {
     if (STORAGE === "r2") {
         const ext = file.originalname.split('.').pop() || 'jpg';
@@ -400,7 +407,7 @@ app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     }
 });
 
-// ================= AUTENTICAÇÃO E PERFIL =================
+// ================= AUTENTICAÇÃO E CONTA DE USUÁRIO =================
 app.post('/register', async (req, res) => {
     const { email, password, name, avatar, plan = 'FREE', profile = {} } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Preencha todos os campos' });
@@ -418,7 +425,7 @@ app.post('/register', async (req, res) => {
             password: hash, 
             name, 
             avatar, 
-            plan: plan.toUpperCase(), 
+            plan: plan ? plan.toUpperCase() : 'FREE', 
             studio: false, 
             recoveryCode, 
             profile 
@@ -448,14 +455,18 @@ app.post('/register', async (req, res) => {
 
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Preencha e-mail e senha' });
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Preencha e-mail e senha' });
+    }
 
     try {
         const cleanEmail = email.trim().toLowerCase();
         const user = await User.findOne({ email: cleanEmail });
         if (!user) return res.status(400).json({ error: 'Usuário não encontrado' });
 
-        if (!user.password) return res.status(400).json({ error: 'Usuário sem senha cadastrada no banco' });
+        if (!user.password) {
+            return res.status(400).json({ error: 'Usuário sem senha cadastrada no banco' });
+        }
 
         const ok = await bcrypt.compare(password, user.password);
         if (!ok) return res.status(401).json({ error: 'Senha inválida' });
@@ -508,6 +519,9 @@ app.get('/me', auth, async (req, res) => {
     }
 });
 
+// ================= ROTAS DE PERFIL COMPATÍVEIS COM O APP ANDROID =================
+
+// GET /api/user/profile (Responde ao app Android para carregar os dados)
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId).select('-password');
@@ -529,24 +543,249 @@ app.get('/api/user/profile', auth, async (req, res) => {
             }
         });
     } catch (err) {
+        console.error("ERRO GET PERFIL:", err);
         return res.status(500).json({ error: 'Erro interno ao buscar perfil' });
+    }
+});
+
+// PUT /profile (Sua rota antiga em JSON)
+app.put('/profile', auth, async (req, res) => {
+    const { name, avatar, profile = {} } = req.body;
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        if (typeof name === 'string' && name.trim()) user.name = name.trim();
+        if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
+
+        user.profile = { ...user.profile, ...profile };
+        await user.save();
+
+        return res.json({
+            success: true,
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
+        });
+    } catch (err) {
+        console.error("ERRO AO ATUALIZAR PERFIL:", err);
+        return res.status(500).json({ error: 'Erro interno ao salvar perfil' });
+    }
+});
+
+// PUT /api/user/profile (Rota com Multer para Multipart, recebendo arquivo e texto do Android)
+app.put('/api/user/profile', auth, upload.single('avatar'), async (req, res) => {
+    try {
+        const { name, bio, profile } = req.body;
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        if (typeof name === 'string' && name.trim()) {
+            user.name = name.trim();
+        }
+
+        let userBio = bio || "";
+        if (profile) {
+            try {
+                const parsed = typeof profile === 'string' ? JSON.parse(profile) : profile;
+                if (parsed.bio) userBio = parsed.bio;
+            } catch (e) {
+                userBio = profile;
+            }
+        }
+
+        user.profile = { ...(user.profile || {}), bio: userBio };
+
+        if (req.file) {
+            user.avatar = await handleImageUpload(req.file);
+        }
+
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'Perfil atualizado com sucesso!',
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio !== undefined ? user.studio : false,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            }
+        });
+    } catch (err) {
+        console.error("ERRO AO SALVAR PERFIL COMPLETO:", err);
+        return res.status(500).json({ error: 'Erro interno ao salvar perfil' });
+    }
+});
+
+app.get('/user/presence/:userId', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.userId).select('isOnline lastSeen name avatar');
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            presence: {
+                isOnline: user.isOnline || false,
+                lastSeen: user.lastSeen || null
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ error: 'Erro ao buscar presença' });
+    }
+});
+
+app.post('/verify-purchase', auth, async (req, res) => {
+    const { purchaseToken } = req.body;
+    if (!purchaseToken) return res.status(400).json({ error: 'Token de compra não enviado' });
+
+    try {
+        const user = await User.findByIdAndUpdate(
+            req.userId,
+            { plan: 'VIP', purchaseToken: purchaseToken },
+            { new: true }
+        );
+
+        return res.json({
+            success: true,
+            message: 'Plano atualizado para VIP com sucesso!',
+            plan: user.plan
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao processar compra' });
+    }
+});
+
+app.post('/verify-password', auth, async (req, res) => {
+    const { currentPassword } = req.body;
+    if (!currentPassword) return res.status(400).json({ error: 'Senha não informada' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const valid = await bcrypt.compare(currentPassword, user.password);
+        return res.json({ valid });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-password', auth, async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha alterada com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.put('/change-email', auth, async (req, res) => {
+    const { currentPassword, newEmail } = req.body;
+    if (!currentPassword || !newEmail) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+        return res.status(400).json({ error: 'E-mail inválido' });
+    }
+
+    try {
+        const user = await User.findById(req.userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+        const cleanEmail = newEmail.trim().toLowerCase();
+        const exists = await User.findOne({ email: cleanEmail });
+        if (exists && exists._id.toString() !== user._id.toString()) {
+            return res.status(400).json({ error: 'Este e-mail já está em uso' });
+        }
+
+        user.email = cleanEmail;
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'E-mail alterado com sucesso',
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan || 'FREE',
+                studio: user.studio,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
+    }
+});
+
+app.post('/recover-with-code', async (req, res) => {
+    const { email, recoveryCode, newPassword } = req.body;
+    if (!email || !recoveryCode || !newPassword) return res.status(400).json({ error: 'Preencha todos os campos' });
+
+    try {
+        const cleanEmail = email.trim().toLowerCase();
+        const user = await User.findOne({ email: cleanEmail, recoveryCode });
+        if (!user) return res.status(400).json({ error: 'Código inválido' });
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        return res.json({ success: true, message: 'Senha redefinida com sucesso' });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro interno' });
     }
 });
 
 // ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO =================
 
-// 1. Listar todos os usuários para o aplicativo de Administração
+// 1. Listar todos os usuários cadastrados com suporte a busca (Para o Painel de Controle Admin)
 app.get('/admin/users', auth, async (req, res) => {
     try {
         const admin = await User.findById(req.userId);
         if (!admin || !admin.studio) {
-            return res.status(403).json({ error: 'Acesso negado: Permissão de Studio necessária.' });
+            return res.status(403).json({ error: 'Acesso negado: Apenas o estúdio tem acesso ao gerenciamento de usuários.' });
         }
 
         const { search } = req.query;
         let filter = {};
 
-        if (search) {
+        if (search && search.trim()) {
             const regex = new RegExp(search.trim(), 'i');
             filter = { $or: [{ name: regex }, { email: regex }] };
         }
@@ -589,7 +828,7 @@ app.put('/admin/user/:id', auth, async (req, res) => {
 
         return res.json({
             success: true,
-            message: 'Perfil de usuário atualizado com sucesso!',
+            message: 'Perfil de usuário atualizado no painel com sucesso!',
             user: updatedUser
         });
     } catch (err) {
@@ -598,7 +837,63 @@ app.put('/admin/user/:id', auth, async (req, res) => {
     }
 });
 
-// 3. Deletar usuário via Painel Admin
+// 3. Alterar plano de usuário por e-mail
+app.put('/admin/change-plan', auth, async (req, res) => {
+    const { email, plan } = req.body;
+    if (!email || !plan) return res.status(400).json({ error: 'Preencha e-mail e plano' });
+
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
+        const user = await User.findOneAndUpdate(
+            { email: cleanEmail },
+            { plan: plan.toUpperCase() },
+            { new: true }
+        ).select('-password');
+
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            message: `Plano alterado para ${user.plan}`,
+            user
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao alterar plano' });
+    }
+});
+
+// 4. Alternar status de Studio/Agente de Suporte de um Usuário
+app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
+    try {
+        const admin = await User.findById(req.userId);
+        if (!admin || !admin.studio) {
+            return res.status(403).json({ error: 'Acesso negado' });
+        }
+
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        user.studio = !user.studio;
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: `Permissão de Studio ${user.studio ? 'ativada' : 'desativada'} com sucesso!`,
+            studio: user.studio
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao alterar permissão de estúdio' });
+    }
+});
+
+// 5. Excluir conta de usuário via painel Admin
 app.delete('/admin/user/:id', auth, async (req, res) => {
     try {
         const admin = await User.findById(req.userId);
@@ -616,7 +911,180 @@ app.delete('/admin/user/:id', auth, async (req, res) => {
     }
 });
 
-// Inicialização
+// ================= ROTAS DE SUPORTE =================
+app.get('/support/messages/:targetUserId?', auth, async (req, res) => {
+    try {
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let queryUserId = req.userId;
+        if (requestingUser.studio && req.params.targetUserId) {
+            queryUserId = req.params.targetUserId;
+        }
+
+        const messages = await SupportMessage.find({ userId: queryUserId })
+            .sort({ createdAt: 1 })
+            .populate('senderId', 'name avatar email isOnline lastSeen');
+
+        return res.json({ success: true, messages });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao buscar mensagens' });
+    }
+});
+
+app.get('/support/admin/chats', auth, async (req, res) => {
+    try {
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser || !requestingUser.studio) {
+            return res.status(403).json({ error: 'Acesso negado. Apenas estúdio autorizado.' });
+        }
+
+        const chats = await SupportMessage.aggregate([
+            { $sort: { createdAt: -1 } },             {$group: {
+                    _id: "$userId",
+                    lastMessage: { $first: "$message" },
+                    lastMessageDate: { $first: "$createdAt" },
+                    lastMessageStatus: { $first: "$status" },
+                    lastMessageSenderModel: { $first: "$senderModel" },
+                    unreadCount: {
+                        $sum: {$cond: [
+                                { $and: [
+                                    { $eq: ["$senderModel", "user"] },
+                                    { $ne: ["$status", "read"] }
+                                ]},
+                                1,
+                                0
+                            ]
+                        }
+                    }
+                }
+            },
+            { $sort: { lastMessageDate: -1 } }
+        ]);
+
+        const populatedChats = await User.populate(chats, {
+            path: '_id',
+            select: 'name email avatar plan studio isOnline lastSeen'
+        });
+
+        return res.json({ success: true, chats: populatedChats });
+    } catch (err)  {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao listar chats' });
+    }
+});
+
+app.post('/support/message', auth, async (req, res) => {
+    try {
+        const { message, targetUserId } = req.body;
+        const senderId = req.userId;
+
+        const sender = await User.findById(senderId);
+        if (!sender) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        const isAdmin = sender.studio === true; 
+
+        const newMessage = await SupportMessage.create({
+            userId: isAdmin ? targetUserId : senderId,
+            senderId,
+            senderModel: isAdmin ? 'admin' : 'user',
+            message,
+            status: 'sent',
+            createdAt: new Date()
+        });
+
+        const populatedMessage = await SupportMessage.findById(newMessage._id)
+            .populate('senderId', 'name avatar email isOnline lastSeen');
+
+        if (isAdmin) {
+            io.to(`user_${targetUserId}`).emit('new_support_message', populatedMessage);
+            io.to('admin_support_room').emit('new_support_message', populatedMessage);
+        } else {
+            io.to(`user_${senderId}`).emit('new_support_message', populatedMessage);
+            io.to('admin_support_room').emit('new_support_message', populatedMessage);
+        }
+
+        return res.status(200).json({ success: true, message: populatedMessage });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/support/read', auth, async (req, res) => {
+    const { targetUserId } = req.body;
+    try {
+        const requestingUser = await User.findById(req.userId);
+        if (!requestingUser) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        let chatUserId = req.userId;
+        if (requestingUser.studio && targetUserId) {
+            chatUserId = targetUserId;
+        }
+
+        const now = new Date();
+        await SupportMessage.updateMany(
+            { userId: chatUserId, senderId: { $ne: req.userId }, status: {$ne: 'read' } },
+            { $set: { status: 'read', readAt: now } }
+        );
+
+        io.to(`user_${chatUserId}`).emit('messages_read', { userId: chatUserId, status: 'read', readAt: now });
+        io.to('admin_support_room').emit('messages_read', { userId: chatUserId, status: 'read', readAt: now });
+
+        return res.json({ success: true, readAt: now });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Erro ao marcar mensagens como lidas' });
+    }
+});
+
+// ================= ROTAS DE REPORTES =================
+app.get('/api/reports', async (req, res) => {
+    try {
+        const reports = await Report.find().sort({ createdAt: -1 });
+        return res.status(200).json({ success: true, reports });
+    } catch (err) {
+        console.error('Erro ao listar reportes:', err);
+        return res.status(500).json({ error: 'Erro interno ao listar reportes' });
+    }
+});
+
+app.post('/api/report', async (req, res) => {
+    try {
+        const { itemId, title, reason, userId } = req.body;
+        console.log(`[REPORTE HTTP] ID: ${itemId} | Título: ${title} | Motivo: ${reason} | Usuário: ${userId}`);
+
+        const newReport = await Report.create({ itemId, title, reason, userId });
+        io.to('admin_support_room').emit('new_report', newReport);
+
+        return res.status(200).json({ success: true, message: 'Reporte salvo com sucesso!', report: newReport });
+    } catch (err) {
+        console.error('Erro ao processar reporte:', err);
+        return res.status(500).json({ error: 'Erro interno ao salvar reporte' });
+    }
+});
+
+app.delete('/api/reports/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'ID de reporte inválido' });
+        }
+
+        const deleted = await Report.findByIdAndDelete(id);
+        if (!deleted) {
+            return res.status(404).json({ error: 'Reporte não encontrado' });
+        }
+
+        return res.status(200).json({ success: true, message: 'Reporte deletado com sucesso!' });
+    } catch (err) {
+        console.error('Erro ao deletar reporte:', err);
+        return res.status(500).json({ error: 'Erro interno ao deletar reporte' });
+    }
+});
+
+// Inicialização do Servidor
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Servidor unificado do Prime Studio rodando na porta ${PORT}`);
 });

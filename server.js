@@ -86,6 +86,78 @@ async function setOfflineUser(userId, ioInstance, isAgent = false) {
 // ================= TEMPO REAL (SOCKET.IO) =================
 io.on('connection', (socket) => {
 
+    // ----------- SOCKETS DO GERENCIAMENTO DO PAINEL ADMIN (GESTÃO TOTAL DE USUÁRIOS) -----------
+    socket.on('request_all_users', async () => {
+        try {
+            const users = await User.find().select('-password').sort({ createdAt: -1 });
+            socket.emit('response_all_users', users);
+        } catch (err) {
+            console.error('[Socket Admin] Erro ao buscar todos os usuários:', err);
+            socket.emit('error_message', 'Erro ao carregar lista de usuários');
+        }
+    });
+
+    socket.on('update_user_permissions', async (data) => {
+        try {
+            const { userId, plan, studio } = data || {};
+            if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
+
+            const updateFields = {};
+            if (plan !== undefined) updateFields.plan = plan.toString().toUpperCase();
+            if (studio !== undefined) updateFields.studio = Boolean(studio);
+
+            const updatedUser = await User.findByIdAndUpdate(
+                userId,
+                { $set: updateFields },
+                { new: true }
+            ).select('-password');
+
+            if (updatedUser) {
+                // Notifica a sala admin que os dados mudaram
+                io.to('admin_support_room').emit('user_permissions_updated', updatedUser);
+                socket.emit('user_permissions_updated', updatedUser);
+
+                // Notifica em tempo real a própria sala do usuário
+                io.to(`user_${userId}`).emit('user_permissions_updated', updatedUser);
+                io.to(userId.toString()).emit('user_permissions_updated', updatedUser);
+            }
+        } catch (err) {
+            console.error('[Socket Admin] Erro ao atualizar permissões:', err);
+            socket.emit('error_message', 'Erro ao atualizar permissões do usuário');
+        }
+    });
+
+    socket.on('update_user_full_data', async (data) => {
+        try {
+            const { userId, name, email, avatar, plan, studio, profile } = data || {};
+            if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return;
+
+            const updateFields = {};
+            if (name !== undefined) updateFields.name = name.trim();
+            if (email !== undefined) updateFields.email = email.trim().toLowerCase();
+            if (avatar !== undefined) updateFields.avatar = avatar;
+            if (plan !== undefined) updateFields.plan = plan.toString().toUpperCase();
+            if (studio !== undefined) updateFields.studio = Boolean(studio);
+            if (profile !== undefined) updateFields.profile = profile;
+
+            const updatedUser = await User.findByIdAndUpdate(
+                userId,
+                { $set: updateFields },
+                { new: true }
+            ).select('-password');
+
+            if (updatedUser) {
+                io.to('admin_support_room').emit('user_updated', updatedUser);
+                socket.emit('user_updated', updatedUser);
+                io.to(`user_${userId}`).emit('user_updated', updatedUser);
+            }
+        } catch (err) {
+            console.error('[Socket Admin] Erro ao atualizar dados gerais:', err);
+            socket.emit('error_message', 'Erro ao atualizar dados do usuário');
+        }
+    });
+
+    // ----------- SOCKETS ORIGINAIS MANTIDOS -----------
     socket.on('join_user_room', async (userId) => {
         if (userId && mongoose.Types.ObjectId.isValid(userId)) {
             const uIdStr = userId.toString();
@@ -425,7 +497,7 @@ app.post('/register', async (req, res) => {
             password: hash, 
             name, 
             avatar, 
-            plan: plan ? plan.toUpperCase() : 'FREE', 
+            plan, 
             studio: false, 
             recoveryCode, 
             profile 
@@ -774,7 +846,7 @@ app.post('/recover-with-code', async (req, res) => {
 
 // ================= GERENCIAMENTO DO PAINEL ADMIN / STUDIO =================
 
-// 1. Listar todos os usuários cadastrados com suporte a busca (Para o Painel de Controle Admin)
+// 1. Listar todos os usuários cadastrados (Para o Painel de Controle Admin)
 app.get('/admin/users', auth, async (req, res) => {
     try {
         const admin = await User.findById(req.userId);
@@ -782,15 +854,7 @@ app.get('/admin/users', auth, async (req, res) => {
             return res.status(403).json({ error: 'Acesso negado: Apenas o estúdio tem acesso ao gerenciamento de usuários.' });
         }
 
-        const { search } = req.query;
-        let filter = {};
-
-        if (search && search.trim()) {
-            const regex = new RegExp(search.trim(), 'i');
-            filter = { $or: [{ name: regex }, { email: regex }] };
-        }
-
-        const users = await User.find(filter).select('-password').sort({ createdAt: -1 });
+        const users = await User.find().select('-password').sort({ createdAt: -1 });
         return res.json({ success: true, count: users.length, users });
     } catch (err) {
         console.error('[ADMIN LIST ERRO]:', err);
@@ -812,7 +876,7 @@ app.put('/admin/user/:id', auth, async (req, res) => {
         if (name !== undefined) updateFields.name = name.trim();
         if (email !== undefined) updateFields.email = email.trim().toLowerCase();
         if (avatar !== undefined) updateFields.avatar = avatar;
-        if (plan !== undefined) updateFields.plan = plan.toString().toUpperCase();
+        if (plan !== undefined) updateFields.plan = plan.toUpperCase();
         if (studio !== undefined) updateFields.studio = Boolean(studio);
         if (profile !== undefined) updateFields.profile = profile;
 

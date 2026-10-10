@@ -490,8 +490,8 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Rota para o aplicativo de música buscar os dados públicos/vivos do criador pelo ID
-app.get('/user/:id', auth, async (req, res) => {
+// Rota pública para o aplicativo de música buscar os dados do criador pelo ID (Removido o auth para evitar bloqueio)
+app.get('/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id).select('name avatar plan studio');
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });

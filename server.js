@@ -490,6 +490,27 @@ app.post('/login', async (req, res) => {
     }
 });
 
+// Rota para o aplicativo de música buscar os dados públicos/vivos do criador pelo ID
+app.get('/user/:id', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id).select('name avatar plan studio');
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+        return res.json({
+            success: true,
+            id: user._id,
+            name: user.name,
+            avatar: user.avatar,
+            plan: user.plan,
+            studio: user.studio
+        });
+    } catch (err) {
+        console.error("ERRO AO BUSCAR CRIADOR:", err);
+        return res.status(500).json({ error: 'Erro interno ao buscar criador' });
+    }
+});
+
+
 app.get('/me', auth, async (req, res) => {
     try {
         const user = await User.findById(req.userId).select('-password');

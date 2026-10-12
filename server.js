@@ -576,6 +576,21 @@ app.put('/profile', auth, async (req, res) => {
         user.profile = { ...user.profile, ...profile };
         await user.save();
 
+        // TRANSMISSÃO EM TEMPO REAL DA ATUALIZAÇÃO DO USUÁRIO
+        const uIdStr = user._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            plan: user.plan || 'FREE',
+            studio: user.studio !== undefined ? user.studio : false,
+            recoveryCode: user.recoveryCode,
+            profile: user.profile,
+            isOnline: user.isOnline,
+            lastSeen: user.lastSeen
+        });
+
         return res.json({
             success: true,
             user: {
@@ -624,6 +639,21 @@ app.put('/api/user/profile', auth, upload.single('avatar'), async (req, res) => 
         }
 
         await user.save();
+
+        // TRANSMISSÃO EM TEMPO REAL DA ATUALIZAÇÃO DO PERFIL COMPLETO
+        const uIdStr = user._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            plan: user.plan || 'FREE',
+            studio: user.studio !== undefined ? user.studio : false,
+            recoveryCode: user.recoveryCode,
+            profile: user.profile,
+            isOnline: user.isOnline,
+            lastSeen: user.lastSeen
+        });
 
         return res.json({
             success: true,
@@ -674,6 +704,22 @@ app.post('/verify-purchase', auth, async (req, res) => {
             { plan: 'VIP', purchaseToken: purchaseToken },
             { new: true }
         );
+
+        if (user) {
+            const uIdStr = user._id.toString();
+            io.to(`user_${uIdStr}`).emit('user_updated', {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                plan: user.plan,
+                studio: user.studio,
+                recoveryCode: user.recoveryCode,
+                profile: user.profile,
+                isOnline: user.isOnline,
+                lastSeen: user.lastSeen
+            });
+        }
 
         return res.json({
             success: true,
@@ -746,6 +792,18 @@ app.put('/change-email', auth, async (req, res) => {
 
         user.email = cleanEmail;
         await user.save();
+
+        const uIdStr = user._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            plan: user.plan || 'FREE',
+            studio: user.studio,
+            recoveryCode: user.recoveryCode,
+            profile: user.profile
+        });
 
         return res.json({
             success: true,
@@ -844,6 +902,20 @@ const handleUpdateAdminUser = async (req, res) => {
             return res.status(404).json({ error: 'Usuário não encontrado' });
         }
 
+        const uIdStr = updatedUser._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: updatedUser._id,
+            name: updatedUser.name,
+            email: updatedUser.email,
+            avatar: updatedUser.avatar,
+            plan: updatedUser.plan || 'FREE',
+            studio: updatedUser.studio !== undefined ? updatedUser.studio : false,
+            recoveryCode: updatedUser.recoveryCode,
+            profile: updatedUser.profile || {},
+            isOnline: updatedUser.isOnline,
+            lastSeen: updatedUser.lastSeen
+        });
+
         return res.json({
             success: true,
             message: 'Perfil de usuário atualizado no painel com sucesso!',
@@ -908,6 +980,20 @@ app.put('/admin/change-plan', auth, async (req, res) => {
 
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
+        const uIdStr = user._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            plan: user.plan,
+            studio: user.studio,
+            recoveryCode: user.recoveryCode,
+            profile: user.profile,
+            isOnline: user.isOnline,
+            lastSeen: user.lastSeen
+        });
+
         return res.json({
             success: true,
             message: `Plano alterado para ${user.plan}`,
@@ -929,6 +1015,20 @@ app.put('/admin/toggle-studio/:id', auth, async (req, res) => {
 
         user.studio = !user.studio;
         await user.save();
+
+        const uIdStr = user._id.toString();
+        io.to(`user_${uIdStr}`).emit('user_updated', {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            plan: user.plan,
+            studio: user.studio,
+            recoveryCode: user.recoveryCode,
+            profile: user.profile,
+            isOnline: user.isOnline,
+            lastSeen: user.lastSeen
+        });
 
         return res.json({
             success: true,
@@ -1130,7 +1230,7 @@ app.delete('/api/reports/:id', async (req, res) => {
 });
 
 
-// ================= NOVO: SISTEMA DE LIKE / DISLIKE =================
+// ================= SISTEMA DE LIKE / DISLIKE =================
 
 const InteractionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -1139,12 +1239,10 @@ const InteractionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
-// Garante que o mesmo usuário só pode ter um registro de voto por item
 InteractionSchema.index({ userId: 1, itemId: 1 }, { unique: true });
 
 const Interaction = mongoose.model('Interaction', InteractionSchema);
 
-// Registrar ou Alternar Voto (Like / Dislike)
 app.post('/api/interaction/vote', auth, async (req, res) => {
     try {
         const { itemId, type } = req.body;
@@ -1154,31 +1252,32 @@ app.post('/api/interaction/vote', auth, async (req, res) => {
             return res.status(400).json({ error: 'Dados inválidos. Informe o itemId e type (LIKE ou DISLIKE).' });
         }
 
-        // Verifica se já existe um voto deste usuário para este item
         const existingVote = await Interaction.findOne({ userId, itemId });
-
         let currentStatus = 'NEUTRAL';
 
         if (existingVote) {
             if (existingVote.type === type) {
-                // Se clicou no mesmo botão novamente, remove o voto (torna neutro)
                 await Interaction.deleteOne({ _id: existingVote._id });
                 currentStatus = 'NEUTRAL';
             } else {
-                // Se o voto anterior era o oposto, atualiza para o novo tipo
                 existingVote.type = type;
                 await existingVote.save();
                 currentStatus = type;
             }
         } else {
-            // Se não votou ainda, cria o novo registro
             await Interaction.create({ userId, itemId, type });
             currentStatus = type;
         }
 
-        // Calcula os totais atualizados para o item
         const totalLikes = await Interaction.countDocuments({ itemId, type: 'LIKE' });
         const totalDislikes = await Interaction.countDocuments({ itemId, type: 'DISLIKE' });
+
+        // TRANSMISSÃO EM TEMPO REAL PARA ATUALIZAR LIKES/DISLIKES EM TODOS OS DISPOSITIVOS
+        io.emit('item_interaction_updated', {
+            itemId: itemId,
+            TotalLikes: totalLikes,
+            TotalDislikes: totalDislikes
+        });
 
         return res.status(200).json({
             success: true,
@@ -1193,7 +1292,6 @@ app.post('/api/interaction/vote', auth, async (req, res) => {
     }
 });
 
-// Consultar o estado atual de votos de um item para o usuário logado
 app.get('/api/interaction/:itemId', auth, async (req, res) => {
     try {
         const { itemId } = req.params;
@@ -1216,7 +1314,7 @@ app.get('/api/interaction/:itemId', auth, async (req, res) => {
     }
 });
 
-// ================= FIM DAS ROTAS DE LIKE / DISLIKE =================
+// ================= FIM DAS ROTAS =================
 
 
 server.listen(PORT, '0.0.0.0', () => {

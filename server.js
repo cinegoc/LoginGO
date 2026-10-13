@@ -407,9 +407,7 @@ async function deleteImageFromStorage(imageUrl) {
                 }
             }
         } else if (STORAGE === "cloudinary") {
-            // Extração e remoção do Cloudinary se necessário
             const parts = imageUrl.split('/');
-            const filenameWithExt = parts[parts.length - 1];
             const publicId = parts.slice(-2).join('/').split('.')[0];
             if (publicId) {
                 await cloudinary.uploader.destroy(publicId);
@@ -518,7 +516,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Rota pública para o aplicativo de música buscar os dados do criador pelo ID
+// Rotas de criador compatíveis com o aplicativo (suporta tanto /user/:id quanto /api/user/creator/:id)
 app.get('/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id).select('name avatar plan studio');
@@ -538,6 +536,25 @@ app.get('/user/:id', async (req, res) => {
     }
 });
 
+app.get('/api/user/creator/:id', async (req, res) => {
+    try {
+        const creator = await User.findById(req.params.id).select('name avatar plan studio');
+        if (!creator) return res.status(404).json({ error: 'Criador não encontrado' });
+
+        return res.json({
+            success: true,
+            creator: {
+                name: creator.name,
+                avatar: creator.avatar,
+                plan: creator.plan,
+                studio: creator.studio
+            }
+        });
+    } catch (err) {
+        console.error("ERRO AO BUSCAR CRIADOR API:", err);
+        return res.status(500).json({ error: 'Erro interno ao buscar criador' });
+    }
+});
 
 app.get('/me', auth, async (req, res) => {
     try {
@@ -1120,7 +1137,7 @@ app.get('/support/admin/chats', auth, async (req, res) => {
         }
 
         const chats = await SupportMessage.aggregate([
-            { $sort: { createdAt: -1 } },             {$group: {
+            { $sort: { createdAt: -1 } }, {$group: {
                     _id: "$userId",
                     lastMessage: { $first: "$message" },
                     lastMessageDate: { $first: "$createdAt" },
@@ -1263,7 +1280,6 @@ app.delete('/api/reports/:id', async (req, res) => {
     }
 });
 
-
 // ================= SISTEMA DE LIKE / DISLIKE =================
 
 const InteractionSchema = new mongoose.Schema({
@@ -1347,18 +1363,17 @@ app.get('/api/interaction/:itemId', auth, async (req, res) => {
     }
 });
 
-
-// ================= SISTEMA INTELIGENTE DE PLAYLISTS PERSONALIZADAS (FILMES, SÉRIES E MÚSICAS) =================
+// ================= SISTEMA INTELIGENTE DE PLAYLISTS PERSONALIZADAS =================
 
 const PlaylistSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     title: { type: String, required: true },
-    type: { type: String, enum: ['MOVIE', 'SERIES', 'MUSIC'], default: 'MOVIE' }, // Suporte completo para Filmes, Séries e Músicas
-    coverUrl: { type: String, default: "" }, // Capa personalizada da playlist
+    type: { type: String, enum: ['MOVIE', 'SERIES', 'MUSIC'], default: 'MOVIE' },
+    coverUrl: { type: String, default: "" },
     items: [{
-        itemId: { type: String, required: true }, // ID estável do filme, série ou música
+        itemId: { type: String, required: true },
         title: String,
-        artist: String, // Útil para músicas
+        artist: String,
         coverUrl: String,
         synopsis: String,
         addedAt: { type: Date, default: Date.now }
@@ -1369,7 +1384,6 @@ const PlaylistSchema = new mongoose.Schema({
 
 const Playlist = mongoose.model('Playlist', PlaylistSchema);
 
-// 1. Listar todas as playlists do usuário (com filtro opcional por tipo: ?type=MOVIE ou MUSIC)
 app.get('/api/playlists', auth, async (req, res) => {
     try {
         const { type } = req.query;
@@ -1386,7 +1400,6 @@ app.get('/api/playlists', auth, async (req, res) => {
     }
 });
 
-// 2. Criar nova playlist (com suporte opcional a upload de capa inteligente multipart/form-data)
 app.post('/api/playlists', auth, upload.single('cover'), async (req, res) => {
     try {
         const { title, type = 'MOVIE' } = req.body;
@@ -1407,7 +1420,6 @@ app.post('/api/playlists', auth, upload.single('cover'), async (req, res) => {
             items: []
         });
 
-        // Sincronização em tempo real via Socket.io
         io.to(`user_${req.userId}`).emit('playlist_created', newPlaylist);
 
         return res.status(201).json({ success: true, playlist: newPlaylist });
@@ -1417,7 +1429,6 @@ app.post('/api/playlists', auth, upload.single('cover'), async (req, res) => {
     }
 });
 
-// 3. Atualizar dados da playlist (Nome, Tipo ou Substituir Capa com limpeza inteligente de lixo no R2)
 app.put('/api/playlists/:id', auth, upload.single('cover'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -1439,7 +1450,6 @@ app.put('/api/playlists/:id', auth, upload.single('cover'), async (req, res) => 
             playlist.type = type.toUpperCase();
         }
 
-        // Gestão inteligente de imagem: Se uma nova imagem foi enviada, deleta a antiga do bucket para não gerar lixo
         if (req.file) {
             if (playlist.coverUrl) {
                 await deleteImageFromStorage(playlist.coverUrl);
@@ -1464,7 +1474,6 @@ app.put('/api/playlists/:id', auth, upload.single('cover'), async (req, res) => 
     }
 });
 
-// 4. Adicionar item (filme, série ou música) à playlist
 app.post('/api/playlists/:id/items', auth, async (req, res) => {
     try {
         const { id } = req.params;
@@ -1479,7 +1488,6 @@ app.post('/api/playlists/:id/items', auth, async (req, res) => {
             return res.status(404).json({ error: 'Playlist não encontrada.' });
         }
 
-        // Verifica se o item já existe na playlist para evitar duplicatas
         const exists = playlist.items.some(item => item.itemId === itemId);
         if (exists) {
             return res.status(400).json({ error: 'Este item já está salvo nesta playlist.' });
@@ -1505,7 +1513,6 @@ app.post('/api/playlists/:id/items', auth, async (req, res) => {
     }
 });
 
-// 5. Remover item específico da playlist
 app.delete('/api/playlists/:id/items/:itemId', auth, async (req, res) => {
     try {
         const { id, itemId } = req.params;
@@ -1538,7 +1545,6 @@ app.delete('/api/playlists/:id/items/:itemId', auth, async (req, res) => {
     }
 });
 
-// 6. Deletar playlist inteira (com limpeza automática da imagem de capa vinculada no Cloudflare R2)
 app.delete('/api/playlists/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
@@ -1552,7 +1558,6 @@ app.delete('/api/playlists/:id', auth, async (req, res) => {
             return res.status(404).json({ error: 'Playlist não encontrada.' });
         }
 
-        // Remove a capa do storage em nuvem se houver, evitando acúmulo de lixo
         if (playlist.coverUrl) {
             await deleteImageFromStorage(playlist.coverUrl);
         }
@@ -1569,7 +1574,6 @@ app.delete('/api/playlists/:id', auth, async (req, res) => {
 });
 
 // ================= FIM DAS ROTAS =================
-
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Servidor unificado do Prime Studio rodando na porta ${PORT}`);

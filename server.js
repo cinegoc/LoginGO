@@ -9,7 +9,8 @@ const { Server } = require('socket.io');
 
 const {
     S3Client,
-    PutObjectCommand
+    PutObjectCommand,
+    DeleteObjectCommand
 } = require('@aws-sdk/client-s3');
 
 const cloudinary = require('cloudinary').v2;
@@ -358,10 +359,10 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-async function handleImageUpload(file) {
+async function handleImageUpload(file, folder = "avatars") {
     if (STORAGE === "r2") {
         const ext = file.originalname.split('.').pop() || 'jpg';
-        const fileName = `avatars/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
+        const fileName = `${folder}/${Date.now()}-${Math.random().toString(36).substring(2)}.${ext}`;
 
         await r2.send(
             new PutObjectCommand({
@@ -378,7 +379,7 @@ async function handleImageUpload(file) {
     if (STORAGE === "cloudinary") {
         const result = await new Promise((resolve, reject) => {
             const stream = cloudinary.uploader.upload_stream(
-                { folder: "avatars" },
+                { folder: folder },
                 (error, result) => {
                     if (error) reject(error);
                     else resolve(result);
@@ -392,10 +393,37 @@ async function handleImageUpload(file) {
     throw new Error("Storage não configurado corretamente");
 }
 
+async function deleteImageFromStorage(imageUrl) {
+    if (!imageUrl || typeof imageUrl !== 'string') return;
+    try {
+        if (STORAGE === "r2" && process.env.R2_PUBLIC_URL) {
+            if (imageUrl.startsWith(process.env.R2_PUBLIC_URL)) {
+                const key = imageUrl.replace(process.env.R2_PUBLIC_URL + "/", "");
+                if (key) {
+                    await r2.send(new DeleteObjectCommand({
+                        Bucket: process.env.R2_BUCKET,
+                        Key: key
+                    }));
+                }
+            }
+        } else if (STORAGE === "cloudinary") {
+            // Extração e remoção do Cloudinary se necessário
+            const parts = imageUrl.split('/');
+            const filenameWithExt = parts[parts.length - 1];
+            const publicId = parts.slice(-2).join('/').split('.')[0];
+            if (publicId) {
+                await cloudinary.uploader.destroy(publicId);
+            }
+        }
+    } catch (e) {
+        console.error("[Storage] Erro ao deletar imagem antiga:", e);
+    }
+}
+
 app.post('/upload-avatar', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' });
-        const url = await handleImageUpload(req.file);
+        const url = await handleImageUpload(req.file, "avatars");
         return res.json({ success: true, url });
     } catch (err) {
         console.error("UPLOAD ERROR:", err);
@@ -490,7 +518,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Rota pública para o aplicativo de música buscar os dados do criador pelo ID (Removido o auth para evitar bloqueio)
+// Rota pública para o aplicativo de música buscar os dados do criador pelo ID
 app.get('/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id).select('name avatar plan studio');
@@ -571,12 +599,16 @@ app.put('/profile', auth, async (req, res) => {
         if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
 
         if (typeof name === 'string' && name.trim()) user.name = name.trim();
-        if (typeof avatar === 'string' && avatar.trim()) user.avatar = avatar;
+        if (typeof avatar === 'string' && avatar.trim()) {
+            if (user.avatar && user.avatar !== avatar) {
+                await deleteImageFromStorage(user.avatar);
+            }
+            user.avatar = avatar;
+        }
 
         user.profile = { ...user.profile, ...profile };
         await user.save();
 
-        // TRANSMISSÃO EM TEMPO REAL DA ATUALIZAÇÃO DO USUÁRIO
         const uIdStr = user._id.toString();
         io.to(`user_${uIdStr}`).emit('user_updated', {
             id: user._id,
@@ -635,12 +667,14 @@ app.put('/api/user/profile', auth, upload.single('avatar'), async (req, res) => 
         user.profile = { ...(user.profile || {}), bio: userBio };
 
         if (req.file) {
-            user.avatar = await handleImageUpload(req.file);
+            if (user.avatar) {
+                await deleteImageFromStorage(user.avatar);
+            }
+            user.avatar = await handleImageUpload(req.file, "avatars");
         }
 
         await user.save();
 
-        // TRANSMISSÃO EM TEMPO REAL DA ATUALIZAÇÃO DO PERFIL COMPLETO
         const uIdStr = user._id.toString();
         io.to(`user_${uIdStr}`).emit('user_updated', {
             id: user._id,
@@ -1272,7 +1306,6 @@ app.post('/api/interaction/vote', auth, async (req, res) => {
         const totalLikes = await Interaction.countDocuments({ itemId, type: 'LIKE' });
         const totalDislikes = await Interaction.countDocuments({ itemId, type: 'DISLIKE' });
 
-        // TRANSMISSÃO EM TEMPO REAL PARA ATUALIZAR LIKES/DISLIKES EM TODOS OS DISPOSITIVOS
         io.emit('item_interaction_updated', {
             itemId: itemId,
             TotalLikes: totalLikes,
@@ -1311,6 +1344,227 @@ app.get('/api/interaction/:itemId', auth, async (req, res) => {
     } catch (err) {
         console.error('Erro ao buscar status de interação:', err);
         return res.status(500).json({ error: 'Erro interno ao buscar interações' });
+    }
+});
+
+
+// ================= SISTEMA INTELIGENTE DE PLAYLISTS PERSONALIZADAS (FILMES, SÉRIES E MÚSICAS) =================
+
+const PlaylistSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    title: { type: String, required: true },
+    type: { type: String, enum: ['MOVIE', 'SERIES', 'MUSIC'], default: 'MOVIE' }, // Suporte completo para Filmes, Séries e Músicas
+    coverUrl: { type: String, default: "" }, // Capa personalizada da playlist
+    items: [{
+        itemId: { type: String, required: true }, // ID estável do filme, série ou música
+        title: String,
+        artist: String, // Útil para músicas
+        coverUrl: String,
+        synopsis: String,
+        addedAt: { type: Date, default: Date.now }
+    }],
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
+});
+
+const Playlist = mongoose.model('Playlist', PlaylistSchema);
+
+// 1. Listar todas as playlists do usuário (com filtro opcional por tipo: ?type=MOVIE ou MUSIC)
+app.get('/api/playlists', auth, async (req, res) => {
+    try {
+        const { type } = req.query;
+        let query = { userId: req.userId };
+        if (type) {
+            query.type = type.toUpperCase();
+        }
+
+        const playlists = await Playlist.find(query).sort({ updatedAt: -1 });
+        return res.status(200).json({ success: true, playlists });
+    } catch (err) {
+        console.error('Erro ao listar playlists:', err);
+        return res.status(500).json({ error: 'Erro interno ao listar playlists' });
+    }
+});
+
+// 2. Criar nova playlist (com suporte opcional a upload de capa inteligente multipart/form-data)
+app.post('/api/playlists', auth, upload.single('cover'), async (req, res) => {
+    try {
+        const { title, type = 'MOVIE' } = req.body;
+        if (!title || !title.trim()) {
+            return res.status(400).json({ error: 'O título da playlist é obrigatório.' });
+        }
+
+        let coverUrl = req.body.coverUrl || "";
+        if (req.file) {
+            coverUrl = await handleImageUpload(req.file, "playlists");
+        }
+
+        const newPlaylist = await Playlist.create({
+            userId: req.userId,
+            title: title.trim(),
+            type: ['MOVIE', 'SERIES', 'MUSIC'].includes(type.toUpperCase()) ? type.toUpperCase() : 'MOVIE',
+            coverUrl,
+            items: []
+        });
+
+        // Sincronização em tempo real via Socket.io
+        io.to(`user_${req.userId}`).emit('playlist_created', newPlaylist);
+
+        return res.status(201).json({ success: true, playlist: newPlaylist });
+    } catch (err) {
+        console.error('Erro ao criar playlist:', err);
+        return res.status(500).json({ error: 'Erro interno ao criar playlist' });
+    }
+});
+
+// 3. Atualizar dados da playlist (Nome, Tipo ou Substituir Capa com limpeza inteligente de lixo no R2)
+app.put('/api/playlists/:id', auth, upload.single('cover'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { title, type } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'ID de playlist inválido.' });
+        }
+
+        const playlist = await Playlist.findOne({ _id: id, userId: req.userId });
+        if (!playlist) {
+            return res.status(404).json({ error: 'Playlist não encontrada.' });
+        }
+
+        if (title && title.trim()) {
+            playlist.title = title.trim();
+        }
+        if (type && ['MOVIE', 'SERIES', 'MUSIC'].includes(type.toUpperCase())) {
+            playlist.type = type.toUpperCase();
+        }
+
+        // Gestão inteligente de imagem: Se uma nova imagem foi enviada, deleta a antiga do bucket para não gerar lixo
+        if (req.file) {
+            if (playlist.coverUrl) {
+                await deleteImageFromStorage(playlist.coverUrl);
+            }
+            playlist.coverUrl = await handleImageUpload(req.file, "playlists");
+        } else if (req.body.coverUrl !== undefined) {
+            if (playlist.coverUrl && playlist.coverUrl !== req.body.coverUrl) {
+                await deleteImageFromStorage(playlist.coverUrl);
+            }
+            playlist.coverUrl = req.body.coverUrl;
+        }
+
+        playlist.updatedAt = new Date();
+        await playlist.save();
+
+        io.to(`user_${req.userId}`).emit('playlist_updated', playlist);
+
+        return res.status(200).json({ success: true, playlist });
+    } catch (err) {
+        console.error('Erro ao atualizar playlist:', err);
+        return res.status(500).json({ error: 'Erro interno ao atualizar playlist' });
+    }
+});
+
+// 4. Adicionar item (filme, série ou música) à playlist
+app.post('/api/playlists/:id/items', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { itemId, title, artist, coverUrl, synopsis } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(id) || !itemId) {
+            return res.status(400).json({ error: 'ID da playlist ou itemId inválido.' });
+        }
+
+        const playlist = await Playlist.findOne({ _id: id, userId: req.userId });
+        if (!playlist) {
+            return res.status(404).json({ error: 'Playlist não encontrada.' });
+        }
+
+        // Verifica se o item já existe na playlist para evitar duplicatas
+        const exists = playlist.items.some(item => item.itemId === itemId);
+        if (exists) {
+            return res.status(400).json({ error: 'Este item já está salvo nesta playlist.' });
+        }
+
+        playlist.items.push({
+            itemId,
+            title: title || "",
+            artist: artist || "",
+            coverUrl: coverUrl || "",
+            synopsis: synopsis || "",
+            addedAt: new Date()
+        });
+        playlist.updatedAt = new Date();
+        await playlist.save();
+
+        io.to(`user_${req.userId}`).emit('playlist_updated', playlist);
+
+        return res.status(200).json({ success: true, message: 'Item adicionado com sucesso!', playlist });
+    } catch (err) {
+        console.error('Erro ao adicionar item à playlist:', err);
+        return res.status(500).json({ error: 'Erro interno ao adicionar item' });
+    }
+});
+
+// 5. Remover item específico da playlist
+app.delete('/api/playlists/:id/items/:itemId', auth, async (req, res) => {
+    try {
+        const { id, itemId } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'ID da playlist inválido.' });
+        }
+
+        const playlist = await Playlist.findOne({ _id: id, userId: req.userId });
+        if (!playlist) {
+            return res.status(404).json({ error: 'Playlist não encontrada.' });
+        }
+
+        const initialLength = playlist.items.length;
+        playlist.items = playlist.items.filter(item => item.itemId !== itemId);
+
+        if (playlist.items.length === initialLength) {
+            return res.status(404).json({ error: 'Item não encontrado nesta playlist.' });
+        }
+
+        playlist.updatedAt = new Date();
+        await playlist.save();
+
+        io.to(`user_${req.userId}`).emit('playlist_updated', playlist);
+
+        return res.status(200).json({ success: true, message: 'Item removido com sucesso!', playlist });
+    } catch (err) {
+        console.error('Erro ao remover item da playlist:', err);
+        return res.status(500).json({ error: 'Erro interno ao remover item' });
+    }
+});
+
+// 6. Deletar playlist inteira (com limpeza automática da imagem de capa vinculada no Cloudflare R2)
+app.delete('/api/playlists/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'ID de playlist inválido.' });
+        }
+
+        const playlist = await Playlist.findOne({ _id: id, userId: req.userId });
+        if (!playlist) {
+            return res.status(404).json({ error: 'Playlist não encontrada.' });
+        }
+
+        // Remove a capa do storage em nuvem se houver, evitando acúmulo de lixo
+        if (playlist.coverUrl) {
+            await deleteImageFromStorage(playlist.coverUrl);
+        }
+
+        await Playlist.deleteOne({ _id: id });
+
+        io.to(`user_${req.userId}`).emit('playlist_deleted', { playlistId: id });
+
+        return res.status(200).json({ success: true, message: 'Playlist deletada com sucesso!' });
+    } catch (err) {
+        console.error('Erro ao deletar playlist:', err);
+        return res.status(500).json({ error: 'Erro interno ao deletar playlist' });
     }
 });
 
